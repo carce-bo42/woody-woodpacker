@@ -1,7 +1,7 @@
-NAME := ft_nm
+NAME := woody
 
-CFLAGS = -Wall -Wextra -Werror
-#CFLAGS += -Wno-comment -Wno-unused-variable -Wno-unused-parameter #-std=c11
+CFLAGS = #-Wall -Wextra -Werror
+CFLAGS += -Wno-comment -Wno-unused-variable -Wno-unused-parameter
 CFLAGS += -std=c11 #-m32 #-fsanitize=address
 
 CC := gcc
@@ -17,7 +17,7 @@ OBJ_DIR := obj
 OBJ := $(addprefix $(OBJ_DIR)/, $(SRC_FILES:.c=.o))
 
 INC_DIR := include
-INC_FLAGS = -I $(INC_DIR) -I $(LIBFT_DIR)
+INC_FLAGS = -I $(INC_DIR) -I $(LIBFT_DIR) -I.
 
 .PHONY: all
 

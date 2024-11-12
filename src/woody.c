@@ -15,6 +15,8 @@
 #include <sys/mman.h>
 #include <string.h>
 
+void debug_program_header(void* map, size_t size, Elf64_Phdr* phdr);
+
 /* Endianness of the binary */
 static int end = 0;
 
@@ -23,6 +25,13 @@ static int end = 0;
                     sizeof(p) == 4 ? __builtin_bswap32(p) : \
                                      __builtin_bswap16(p))
 
+/* See https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.eheader.html#elfid */
+static size_t get_ehdr_e_shnum(void* map, Elf64_Ehdr* ehdr) {
+    if (ehdr->e_shnum >= SHN_LORESERVE) {
+        return swap(((Elf64_Shdr *)(map + swap(ehdr->e_shoff)))->sh_size);
+    }
+    return swap(ehdr->e_shnum);
+}
 
 /*
  * Calcula cuanto mide el fichero elf buscando cual es el offset + tamaño
@@ -78,15 +87,11 @@ static size_t get_elf_size(void *map, Elf64_Ehdr *ehdr, size_t actual_size) {
 int do_woody(char* filename, void* map, size_t size) {
 
     Elf64_Ehdr *ehdr = map;          /* Elf Header */
-    Elf64_Shdr *shstrtab = NULL;     /* Section Header String Table */
-    Elf64_Shdr *symtab = NULL;       /* Symbol Table */
-    Elf64_Shdr *strtab = NULL;       /* Symbol Table's String Table */
-    Elf64_Shdr *symtab_shndx = NULL; /* Symbol Table Extended Section indexes */
     size_t phnum = -1;
 
     /* static global, used in every swap */
     end = ehdr->e_ident[EI_DATA];
-    
+
     if ((ehdr->e_ident[EI_DATA] != ELFDATA2LSB
             && ehdr->e_ident[EI_DATA] != ELFDATA2MSB)
         || ehdr->e_ident[EI_VERSION] != EV_CURRENT
@@ -95,28 +100,24 @@ int do_woody(char* filename, void* map, size_t size) {
         return -1;
     }
 
-    Elf64_Off e_phoff = swap(ehdr->e_shoff);
-    Elf64_Phdr *phtab = map + e_phoff;                /* Program Header Table */
-    Elf64_Half phentsize = swap(ehdr->e_phentsize); /* Program Header Table entry size */
+    Elf64_Off e_phoff = swap(ehdr->e_phoff);
+    Elf64_Phdr *phtab = map + e_phoff;               /* Program Header Table */
+    Elf64_Half phentsize = swap(ehdr->e_phentsize);  /* Program Header Table entry size */
 
     phnum = swap(ehdr->e_phnum);
     for (size_t i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
         Elf64_Word sh_type = swap(phdr->p_type);      /* Section type */
         /* SHT_SYMTAB sólo puede haber una, la del linker es SHT_DYNSYM */
+        debug_program_header(map, size, phdr);
         if (sh_type == PT_LOAD) {
             printf("un PT_LOAD");
-        }
-        /* Hay casos turbios en los que esto es necesario */
-        if (sh_type == SHT_SYMTAB_SHNDX) {
-            symtab_shndx = section;
         }
     }
 
 }
 
-
-void woody_main(char* filename) {
+int woody_main(char* filename) {
 
     int fd = -1;
     struct stat st;
@@ -144,6 +145,7 @@ void woody_main(char* filename) {
         default:
             goto print_file_format_not_recognized;
     }
+    goto cleanup;
 
 print_file_format_not_recognized:
     fprintf(stderr, "ft_nm: %s: file format not recognized\n", filename);
@@ -167,7 +169,7 @@ cleanup:
 
 int main(int argc,char** argv) {
 
-    char filename[4096] = 0;
+    char filename[4096] = {0};
 
     for (int i=1; i<argc; i++) {
         if (argv[i]) {
@@ -176,4 +178,51 @@ int main(int argc,char** argv) {
         woody_main(filename);
     }
     return 0;
+}
+
+
+void debug_program_header(void* map, size_t size, Elf64_Phdr* phdr) {
+
+    (void*)map;
+    (void*)size;
+    printf("===> Program Header <=====");
+    printf("TYPE=");
+    switch(phdr->p_type) {
+        case PT_NULL: printf("PT_NULL"); break;
+        case PT_LOAD: printf("PT_LOAD"); break;
+        case PT_DYNAMIC: printf("PT_DYNAMIC"); break;
+        case PT_INTERP: printf("PT_INTERP"); break;
+        case PT_NOTE: printf("PT_NOTE"); break;
+        case PT_SHLIB: printf("PT_SHLIB"); break;
+        case PT_PHDR: printf("PT_PHDR"); break;
+        case PT_TLS: printf("PT_TLS"); break;
+        case PT_NUM: printf("PT_NUM"); break;
+        case PT_LOOS: printf("PT_LOOS"); break;
+        case PT_GNU_EH_FRAME: printf("PT_GNU_EH_FRAME"); break;
+        case PT_GNU_STACK: printf("PT_GNU_STACK"); break;
+        case PT_GNU_RELRO: printf("PT_GNU_RELRO"); break;
+        case PT_GNU_PROPERTY: printf("PT_GNU_PROPERTY"); break;
+        case PT_GNU_SFRAME: printf("PT_GNU_SFRAME"); break;
+        case PT_LOSUNW: printf("PT_LOSUNW|PT_SUNWBSS"); break;
+        case PT_SUNWSTACK: printf("PT_SUNWSTACK"); break;
+        case PT_HISUNW: printf("PT_HISUNW|PT_HIOS"); break;
+        case PT_LOPROC: printf("PT_LOPROC"); break;
+        case PT_HIPROC: printf("PT_HIPROC"); break;
+        default: printf("????: %x", phdr->p_type);
+    }
+    printf("\n");
+    printf("FLAGS={");
+    if (phdr->p_flags & PF_X) printf(" PF_X");
+    if (phdr->p_flags & PF_W) printf(" PF_W");
+    if (phdr->p_flags & PF_R) printf(" PF_R");
+    if (phdr->p_flags & PF_MASKPROC) printf(" PF_MASKPROC");
+    if (phdr->p_flags & PF_MASKOS) printf(" PF_MASKOS");
+    printf(" }\n");
+    printf("phdr->p_align=%016lx\n", phdr->p_align);
+    printf("phdr->p_filesz=%016lx\n", phdr->p_filesz);
+    printf("phdr->p_memsz=%016lx\n", phdr->p_memsz);
+    printf("phdr->p_offset=%016lx\n", phdr->p_offset);
+    printf("phdr->p_paddr=%016lx\n", phdr->p_paddr);
+    printf("phdr->p_vaddr=%016lx\n", phdr->p_vaddr);
+    printf("------------------------------------------------------------\n");
 }
