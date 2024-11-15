@@ -100,20 +100,38 @@ int do_woody(char* filename, void* map, size_t size) {
         return -1;
     }
 
-    Elf64_Off e_phoff = swap(ehdr->e_phoff);
-    Elf64_Phdr *phtab = map + e_phoff;               /* Program Header Table */
+    Elf64_Addr entrypoint = ehdr->e_entry;
+    Elf64_Phdr *phtab = map + swap(ehdr->e_phoff);    /* Program Header Table */
     Elf64_Half phentsize = swap(ehdr->e_phentsize);  /* Program Header Table entry size */
 
     phnum = swap(ehdr->e_phnum);
+    Elf64_Phdr *last_phdr = NULL;
     for (size_t i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
-        Elf64_Word sh_type = swap(phdr->p_type);      /* Section type */
-        /* SHT_SYMTAB sólo puede haber una, la del linker es SHT_DYNSYM */
+        Elf64_Word sh_type = swap(phdr->p_type);
         debug_program_header(map, size, phdr);
         if (sh_type == PT_LOAD) {
-            printf("un PT_LOAD");
+            if (last_phdr == NULL) {
+                last_phdr = phdr;
+            } else {
+                if (last_phdr->p_vaddr < phdr->p_vaddr) {
+                    last_phdr = phdr;
+                }
+            }
         }
     }
+
+    /* Hay que añadir un phdr al final, y luego el segmento justo despues del phdr.
+     * Es sospechoso ? Que flipas. Pero y lo guapo que esta q.*/
+    Elf64_Phdr *tuned_phdr = malloc(sizeof(Elf64_Phdr*));
+    tuned_phdr->p_offset = size;
+    tuned_phdr->p_flags += (PF_X | PF_R);
+    tuned_phdr->p_align += 0x1000;
+    // 0xfff = 0x1000 - 1
+    // No me fio de esto, podría haber padding pero temas
+    tuned_phdr->p_offset += size + sizeof(Elf64_Phdr);
+    tuned_phdr->p_vaddr = ((last_phdr->p_vaddr + last_phdr->p_memsz+tuned_phdr->p_align) & (~0xfff));
+    tuned_phdr->p_paddr = tuned_phdr->p_paddr;
 
 }
 
