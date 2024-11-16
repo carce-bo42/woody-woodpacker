@@ -132,6 +132,12 @@ int do_woody(char* filename, void* map, size_t size) {
     tuned_phdr->p_offset += size + sizeof(Elf64_Phdr);
     tuned_phdr->p_vaddr = ((last_phdr->p_vaddr + last_phdr->p_memsz+tuned_phdr->p_align) & (~0xfff));
     tuned_phdr->p_paddr = tuned_phdr->p_paddr;
+    tuned_phdr->p_memsz = 0x0999;
+    tuned_phdr->p_filesz = 0x0999;
+
+    // Tenemos que poder enlazar al .text cuando estemos en ejecucion. Pero el ASLR
+    // hace que haya un offset en runtime, asi que tiene que ir en el asm.
+
 
 }
 
@@ -141,6 +147,7 @@ int woody_main(char* filename) {
     struct stat st;
     int ret = 0;
     void* map = MAP_FAILED;
+
 
     if ((fd = open(filename, O_RDONLY | O_NONBLOCK)) == -1) {
         goto print_errno;

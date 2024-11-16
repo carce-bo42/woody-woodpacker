@@ -8,3 +8,8 @@ function print_hex_code() {
 	echo
 }
 
+# Demo de que .text = entrypoint
+# readelf -h woody | grep Entry | awk -F':' '{gsub(" ", "", $2); print $2}'
+# readelf -S woody | grep .text | awk -F' ' '{print $4}' | sed -E 's/[0]*(.*)/0x\1/g'
+
+
