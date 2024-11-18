@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <string.h>
+#include <stddef.h>
 
 void debug_program_header(void* map, size_t size, Elf64_Phdr* phdr);
 
@@ -84,7 +85,7 @@ static size_t get_elf_size(void *map, Elf64_Ehdr *ehdr, size_t actual_size) {
     return total;
 }
 
-int do_woody(char* filename, void* map, size_t size) {
+int do_woody(char* filename, int fd, void* map, size_t size) {
 
     Elf64_Ehdr *ehdr = map;          /* Elf Header */
     size_t phnum = -1;
@@ -106,10 +107,14 @@ int do_woody(char* filename, void* map, size_t size) {
 
     phnum = swap(ehdr->e_phnum);
     Elf64_Phdr *last_phdr = NULL;
+    // Lo que habría que hacer es meterlo despues del phdr de exec
+    // y mover el resto hacia adelante. Esto es muy poco trivial,
+    // asi que lo dejamos para otra iteracion.
     for (size_t i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
         Elf64_Word sh_type = swap(phdr->p_type);
         debug_program_header(map, size, phdr);
+        /* Find last program header. this is not even necessary. */
         if (sh_type == PT_LOAD) {
             if (last_phdr == NULL) {
                 last_phdr = phdr;
@@ -120,20 +125,72 @@ int do_woody(char* filename, void* map, size_t size) {
             }
         }
     }
-
     /* Hay que añadir un phdr al final, y luego el segmento justo despues del phdr.
      * Es sospechoso ? Que flipas. Pero y lo guapo que esta q.*/
-    Elf64_Phdr *tuned_phdr = malloc(sizeof(Elf64_Phdr*));
-    tuned_phdr->p_offset = size;
-    tuned_phdr->p_flags += (PF_X | PF_R);
-    tuned_phdr->p_align += 0x1000;
-    // 0xfff = 0x1000 - 1
-    // No me fio de esto, podría haber padding pero temas
-    tuned_phdr->p_offset += size + sizeof(Elf64_Phdr);
-    tuned_phdr->p_vaddr = ((last_phdr->p_vaddr + last_phdr->p_memsz+tuned_phdr->p_align) & (~0xfff));
-    tuned_phdr->p_paddr = tuned_phdr->p_paddr;
-    tuned_phdr->p_memsz = 0x0999;
-    tuned_phdr->p_filesz = 0x0999;
+    Elf64_Phdr *tuned_phdr = malloc(sizeof(Elf64_Phdr));
+    tuned_phdr->p_offset = swap(size);
+    tuned_phdr->p_flags += swap((PF_X | PF_R));
+    tuned_phdr->p_align += swap(0x1000);
+    tuned_phdr->p_offset += swap(size + sizeof(Elf64_Phdr));
+    /* Alineamos nuestro vaddr con el vaddr mayor que hayamos encontrado. La operacion bitwise
+     * es para que tenga 000 al final, alineado con las paginas de 4K.
+     */
+    tuned_phdr->p_vaddr = swap(((last_phdr->p_vaddr + last_phdr->p_memsz+tuned_phdr->p_align) & (~0xfff)));
+    tuned_phdr->p_paddr = swap(tuned_phdr->p_paddr);
+    /* Esto ya cuando sepa el payload amigo */
+    tuned_phdr->p_memsz = swap(0x0999);
+    tuned_phdr->p_filesz = swap(0x0999);
+
+    /* Creamos el nuevo fichero */
+    const char new_filename[] = "woody_out";
+    int fd_new = open(filename, O_CREAT | O_RDWR, 0644);
+
+    write(fd_new, map, size);
+    // Aqui el puntero apunta al principio.
+    lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
+    // Write new entrypoint
+    Elf64_Addr new_entrypoint = swap(size+sizeof(Elf64_Phdr));
+    write(fd_new, &new_entrypoint, sizeof(Elf64_Addr));
+    // Write new phnum
+    lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
+    Elf64_Half new_phnum = swap(ehdr->e_phnum + 1);
+    write(fd_new, &new_phnum, sizeof(Elf64_Half));
+
+    // Esto NO nos vale porque necesitamos meter un nuevo phdr y este es SECUENCIAL
+    // ========> Hay que mover la phtab entera al final. El espacio que dejamos atrás puede,
+    // si es muy grande, usarse para meter el shellcode, y si no, se puede simplemente memsetear a 0.
+
+    // Modify the program header table
+    lseek(fd_new, phtab + offsetof(Elf64_Phdr, ))
+
+
+
+    // Write new program header
+    lseek(fd_new, 0, SEEK_END);
+    write(fd_new, tuned_phdr, sizeof(Elf64_Phdr));
+
+
+
+    // Offsets a los que estan cada valor:
+/*
+typedef struct {
+    unsigned char e_ident[16]; // 16 bytes
+    uint16_t e_type;           // 2 bytes
+    uint16_t e_machine;        // 2 bytes
+    uint32_t e_version;        // 4 bytes
+    uint64_t e_entry;          // 8 bytes
+    uint64_t e_phoff;          // 8 bytes
+    uint64_t e_shoff;          // 8 bytes
+    uint32_t e_flags;          // 4 bytes
+    uint16_t e_ehsize;         // 2 bytes
+    uint16_t e_phentsize;      // 2 bytes
+    uint16_t e_phnum;          // 2 bytes
+    uint16_t e_shentsize;      // 2 bytes
+    uint16_t e_shnum;          // 2 bytes
+    uint16_t e_shstrndx;       // 2 bytes
+} Elf64_Ehdr;
+*/
+
 
     // Tenemos que poder enlazar al .text cuando estemos en ejecucion. Pero el ASLR
     // hace que haya un offset en runtime, asi que tiene que ir en el asm.
@@ -164,7 +221,7 @@ int woody_main(char* filename) {
     switch ((int)((unsigned char *)map)[EI_CLASS]) {
         case ELFCLASS64:
             if ((unsigned long)st.st_size < sizeof(Elf64_Ehdr)
-                || do_woody(filename, map, st.st_size) == -1)
+                || do_woody(filename, fd, map, st.st_size) == -1)
                 goto print_file_format_not_recognized;
             break;
         default:
