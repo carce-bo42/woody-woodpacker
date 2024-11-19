@@ -16,7 +16,7 @@
 #include <string.h>
 #include <stddef.h>
 
-void debug_program_header(void* map, size_t size, Elf64_Phdr* phdr);
+void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr);
 
 /* Endianness of the binary */
 static int end = 0;
@@ -85,10 +85,41 @@ static size_t get_elf_size(void *map, Elf64_Ehdr *ehdr, size_t actual_size) {
     return total;
 }
 
+void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
+                      Elf64_Ehdr *ehdr, size_t size, Elf64_Half phtable_size)
+{
+
+# define PAYLOAD_SIZE 300
+    new_phdr->p_flags += (PF_X | PF_R);
+    new_phdr->p_align = 0x1000;
+    new_phdr->p_type = PT_LOAD;
+    /* Si no cabe el payload */
+    if (phtable_size < PAYLOAD_SIZE) {
+        new_phdr->p_offset = size + phtable_size + ehdr->e_phentsize;
+    /* Si cabe lo metemos en la anterior phtable.*/
+    } else {
+        new_phdr->p_offset = ehdr->e_phoff;
+    }
+    /* Alineamos nuestro vaddr con el vaddr mayor que hayamos encontrado. La operacion bitwise
+     * es para que tenga 000 al final, alineado con las paginas de 4K.
+     * Al final esto es para el alineamiento una vez se loadee el programa, realmente en el ELF,
+     * (ESTO NO LO SE EXACTAMENTE), el tema de alineamiento no es tan importante.
+     */
+    new_phdr->p_vaddr = ((last->p_vaddr + last->p_memsz+new_phdr->p_align) & (~0xfff));
+    new_phdr->p_paddr = new_phdr->p_paddr;
+    /* Esto ya cuando sepa el payload amigo */
+    new_phdr->p_memsz = 0x0999;
+    new_phdr->p_filesz = 0x0999;
+
+    lseek(fd_new, 0, SEEK_END);
+    write(fd_new, new_phdr, sizeof(Elf64_Phdr));
+}
+
+
 int do_woody(char* filename, int fd, void* map, size_t size) {
 
     Elf64_Ehdr *ehdr = map;          /* Elf Header */
-    size_t phnum = -1;
+    Elf64_Half phnum = -1;
 
     /* static global, used in every swap */
     end = ehdr->e_ident[EI_DATA];
@@ -102,18 +133,25 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     }
 
     Elf64_Addr entrypoint = ehdr->e_entry;
-    Elf64_Phdr *phtab = map + swap(ehdr->e_phoff);    /* Program Header Table */
-    Elf64_Half phentsize = swap(ehdr->e_phentsize);  /* Program Header Table entry size */
+    Elf64_Phdr *phtab = map + ehdr->e_phoff;    /* Program Header Table */
+    Elf64_Half phentsize = ehdr->e_phentsize;  /* Program Header Table entry size */
 
-    phnum = swap(ehdr->e_phnum);
+    phnum = ehdr->e_phnum;
     Elf64_Phdr *last_phdr = NULL;
-    // Lo que habría que hacer es meterlo despues del phdr de exec
-    // y mover el resto hacia adelante. Esto es muy poco trivial,
-    // asi que lo dejamos para otra iteracion.
-    for (size_t i = 0; i < phnum; i++) {
+    Elf64_Half phtable_size = phnum * ehdr->e_phentsize;
+    /* phnum * swap(ehdr->e_phentsize) = bytes de la Program Header Table */
+
+    const char new_filename[] = "/home/carce_bo/42/woody-woodpacker/woody_out";
+    int fd_new = open(new_filename, O_CREAT | O_RDWR, 00644);
+    if (fd_new == -1) {
+        printf("Cannot open file \n");
+    }
+    write(fd_new, map, size);
+
+    for (Elf64_Half i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
-        Elf64_Word sh_type = swap(phdr->p_type);
-        debug_program_header(map, size, phdr);
+        Elf64_Word sh_type = phdr->p_type;
+        //debug_program_header(map, size, phdr);
         /* Find last program header. this is not even necessary. */
         if (sh_type == PT_LOAD) {
             if (last_phdr == NULL) {
@@ -124,51 +162,35 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
                 }
             }
         }
+        /* Vamos copiando los phdr al final del nuevo elf */
+        lseek(fd_new, 0, SEEK_END);
+        write(1, phdr, phentsize);
+        write(fd_new, phdr, phentsize);
     }
-    /* Hay que añadir un phdr al final, y luego el segmento justo despues del phdr.
-     * Es sospechoso ? Que flipas. Pero y lo guapo que esta q.*/
-    Elf64_Phdr *tuned_phdr = malloc(sizeof(Elf64_Phdr));
-    tuned_phdr->p_offset = swap(size);
-    tuned_phdr->p_flags += swap((PF_X | PF_R));
-    tuned_phdr->p_align += swap(0x1000);
-    tuned_phdr->p_offset += swap(size + sizeof(Elf64_Phdr));
-    /* Alineamos nuestro vaddr con el vaddr mayor que hayamos encontrado. La operacion bitwise
-     * es para que tenga 000 al final, alineado con las paginas de 4K.
-     */
-    tuned_phdr->p_vaddr = swap(((last_phdr->p_vaddr + last_phdr->p_memsz+tuned_phdr->p_align) & (~0xfff)));
-    tuned_phdr->p_paddr = swap(tuned_phdr->p_paddr);
-    /* Esto ya cuando sepa el payload amigo */
-    tuned_phdr->p_memsz = swap(0x0999);
-    tuned_phdr->p_filesz = swap(0x0999);
 
-    /* Creamos el nuevo fichero */
-    const char new_filename[] = "woody_out";
-    int fd_new = open(filename, O_CREAT | O_RDWR, 0644);
+    /* metemos el nuevo phdr que apunta al codigo infectado */
+    Elf64_Phdr *new_phdr = malloc(sizeof(Elf64_Phdr));
+    prepare_new_phdr(fd_new, new_phdr, last_phdr, ehdr, size, phtable_size);
 
-    write(fd_new, map, size);
-    // Aqui el puntero apunta al principio.
+    /* change entrypoint*/
     lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
-    // Write new entrypoint
-    Elf64_Addr new_entrypoint = swap(size+sizeof(Elf64_Phdr));
+    Elf64_Addr new_entrypoint = size + (phnum + 1)*ehdr->e_phentsize;
+    printf("new_entrypoint = %lu\n", new_entrypoint);
     write(fd_new, &new_entrypoint, sizeof(Elf64_Addr));
-    // Write new phnum
+    /* change phnum */
     lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
-    Elf64_Half new_phnum = swap(ehdr->e_phnum + 1);
+    Elf64_Half new_phnum = phnum + 1;
+    printf("new_phnum = %lu\n", new_phnum);
     write(fd_new, &new_phnum, sizeof(Elf64_Half));
+    /* change offset of phtable */
+    lseek(fd_new, offsetof(Elf64_Ehdr, e_phoff), SEEK_SET);
+    printf("new_phoff = %lu\n", size);
+    Elf64_Off new_phoff = size;
+    write(fd_new, &new_phoff, sizeof(Elf64_Off));
 
-    // Esto NO nos vale porque necesitamos meter un nuevo phdr y este es SECUENCIAL
-    // ========> Hay que mover la phtab entera al final. El espacio que dejamos atrás puede,
-    // si es muy grande, usarse para meter el shellcode, y si no, se puede simplemente memsetear a 0.
-
-    // Modify the program header table
-    lseek(fd_new, phtab + offsetof(Elf64_Phdr, ))
-
-
-
-    // Write new program header
-    lseek(fd_new, 0, SEEK_END);
-    write(fd_new, tuned_phdr, sizeof(Elf64_Phdr));
-
+    close(fd_new);
+    free(new_phdr);
+    printf("END\n");
 
 
     // Offsets a los que estan cada valor:
@@ -263,7 +285,7 @@ int main(int argc,char** argv) {
 }
 
 
-void debug_program_header(void* map, size_t size, Elf64_Phdr* phdr) {
+void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr) {
 
     (void*)map;
     (void*)size;
