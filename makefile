@@ -2,7 +2,7 @@ NAME := woody
 
 CFLAGS = #-Wall -Wextra -Werror
 CFLAGS += -Wno-comment -Wno-unused-variable -Wno-unused-parameter
-CFLAGS += -std=c11 -g3 -fsanitize=address #-m32 
+CFLAGS += -std=c11 -g3 #-m32 
 
 CC := gcc
 

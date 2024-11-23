@@ -90,7 +90,7 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
 {
 
 # define PAYLOAD_SIZE 300
-    new_phdr->p_flags += (PF_X | PF_R);
+    new_phdr->p_flags += (PF_X | PF_W | PF_R);
     new_phdr->p_align = 0x1000;
     new_phdr->p_type = PT_LOAD;
     /* Si no cabe el payload */
@@ -105,11 +105,11 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
      * Al final esto es para el alineamiento una vez se loadee el programa, realmente en el ELF,
      * (ESTO NO LO SE EXACTAMENTE), el tema de alineamiento no es tan importante.
      */
-    new_phdr->p_vaddr = ((last->p_vaddr + last->p_memsz+new_phdr->p_align) & (~0xfff));
-    new_phdr->p_paddr = new_phdr->p_paddr;
+    new_phdr->p_vaddr = ((last->p_vaddr + last->p_memsz+new_phdr->p_align + 0xfff)) & (~0xfff);
+    new_phdr->p_paddr = new_phdr->p_vaddr;
     /* Esto ya cuando sepa el payload amigo */
-    new_phdr->p_memsz = 0x0999;
-    new_phdr->p_filesz = 0x0999;
+    new_phdr->p_memsz = 0x0000002b;
+    new_phdr->p_filesz = 0x0000002b;
 
     lseek(fd_new, 0, SEEK_END);
     write(fd_new, new_phdr, sizeof(Elf64_Phdr));
@@ -138,6 +138,7 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
 
     phnum = ehdr->e_phnum;
     Elf64_Phdr *last_phdr = NULL;
+    Elf64_Off max_poff_plus_size = 0;
     Elf64_Half phtable_size = phnum * ehdr->e_phentsize;
     /* phnum * swap(ehdr->e_phentsize) = bytes de la Program Header Table */
 
@@ -152,6 +153,9 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
         Elf64_Word sh_type = phdr->p_type;
         //debug_program_header(map, size, phdr);
+        if (phdr->p_offset + phdr->p_memsz > max_poff_plus_size) {
+            max_poff_plus_size = phdr->p_offset + phdr->p_filesz;
+        }
         /* Find last program header. this is not even necessary. */
         if (sh_type == PT_LOAD) {
             if (last_phdr == NULL) {
@@ -164,19 +168,31 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         }
         /* Vamos copiando los phdr al final del nuevo elf */
         lseek(fd_new, 0, SEEK_END);
-        write(1, phdr, phentsize);
         write(fd_new, phdr, phentsize);
     }
+
+    printf("max_poff_plus_size = %x\n", max_poff_plus_size);
+    printf("size = %x\n", size);
+
+    /* El tema */
+    // char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x14\x00\x00\x00\xba\x0a\x00\x00"
+    //                  "\x00\x0f\x05\x49\xba\x42\x42\x42\x42\x42\x42\x42\x42\x41\xff\xe2"
+    //                  "\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
+    //memcpy(&payload[20], (void*)ehdr->e_entry, sizeof(ehdr->e_entry));
+
+
+    char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
 
     /* metemos el nuevo phdr que apunta al codigo infectado */
     Elf64_Phdr *new_phdr = malloc(sizeof(Elf64_Phdr));
     prepare_new_phdr(fd_new, new_phdr, last_phdr, ehdr, size, phtable_size);
 
     /* change entrypoint*/
-    lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
-    Elf64_Addr new_entrypoint = size + (phnum + 1)*ehdr->e_phentsize;
-    printf("new_entrypoint = %lu\n", new_entrypoint);
-    write(fd_new, &new_entrypoint, sizeof(Elf64_Addr));
+    // printf("old_entrypoint = %lu\n", ehdr->e_entry);
+    // lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
+    // Elf64_Addr new_entrypoint = new_phdr->p_vaddr;
+    // printf("new_entrypoint = %lu\n", new_entrypoint);
+    // write(fd_new, &new_entrypoint, sizeof(Elf64_Addr));
     /* change phnum */
     lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
     Elf64_Half new_phnum = phnum + 1;
@@ -187,6 +203,9 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     printf("new_phoff = %lu\n", size);
     Elf64_Off new_phoff = size;
     write(fd_new, &new_phoff, sizeof(Elf64_Off));
+
+    lseek(fd_new, new_phdr->p_offset, SEEK_SET);
+    write(fd_new, payload, sizeof(payload));
 
     close(fd_new);
     free(new_phdr);
@@ -288,7 +307,7 @@ int main(int argc,char** argv) {
 void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr) {
 
     (void*)map;
-    (void*)size;
+    (void)size;
     printf("===> Program Header <=====");
     printf("TYPE=");
     switch(phdr->p_type) {

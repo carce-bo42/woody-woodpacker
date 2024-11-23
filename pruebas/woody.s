@@ -1,6 +1,11 @@
-global _start
+section .data
+woody:
+    db "..WOODY..", 0x0a
 
+section .text
+global _start
 _start:
+
     ; Syscall write
     mov rax, 1               ; syscall write
     mov rdi, 1               ; 1st arg: fd = 1
@@ -8,8 +13,9 @@ _start:
     mov rdx, 10              ; len("..WOODY..\n")
     syscall
 
-	mov r10, 0x4242424242424242   ; to be overriden
-	jmp r10
+	mov rax, 60
+	xor rdi, rdi
+	syscall
 
-woody:
-    db "..WOODY..", 0x0a
+	; mov r10, 0x4242424242424242   ; to be overriden
+	; jmp r10
