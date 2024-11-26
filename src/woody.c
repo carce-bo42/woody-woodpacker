@@ -148,12 +148,14 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         printf("Cannot open file \n");
     }
     write(fd_new, map, size);
-
+    // printf("ehdr->e_shoff: %lx\n", ehdr->e_shoff);
+    // printf("ehdr->e_shnum: %u\n", ehdr->e_shnum);
+    // printf("ehdr->e_shentsize: %u\n", ehdr->e_shentsize);
     for (Elf64_Half i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
         Elf64_Word sh_type = phdr->p_type;
         //debug_program_header(map, size, phdr);
-        if (phdr->p_offset + phdr->p_memsz > max_poff_plus_size) {
+        if (phdr->p_offset + phdr->p_filesz > max_poff_plus_size) {
             max_poff_plus_size = phdr->p_offset + phdr->p_filesz;
         }
         /* Find last program header. this is not even necessary. */
@@ -188,10 +190,10 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     prepare_new_phdr(fd_new, new_phdr, last_phdr, ehdr, size, phtable_size);
 
     /* change entrypoint*/
-    // printf("old_entrypoint = %lu\n", ehdr->e_entry);
-    // lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
-    // Elf64_Addr new_entrypoint = new_phdr->p_vaddr;
-    // printf("new_entrypoint = %lu\n", new_entrypoint);
+    printf("old_entrypoint = %lu\n", ehdr->e_entry);
+    lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
+    Elf64_Addr new_entrypoint = new_phdr->p_vaddr;
+    printf("new_entrypoint = %lu\n", new_entrypoint);
     // write(fd_new, &new_entrypoint, sizeof(Elf64_Addr));
     /* change phnum */
     lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
@@ -212,7 +214,6 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     printf("END\n");
 
 
-    // Offsets a los que estan cada valor:
 /*
 typedef struct {
     unsigned char e_ident[16]; // 16 bytes
@@ -232,10 +233,8 @@ typedef struct {
 } Elf64_Ehdr;
 */
 
-
     // Tenemos que poder enlazar al .text cuando estemos en ejecucion. Pero el ASLR
     // hace que haya un offset en runtime, asi que tiene que ir en el asm.
-
 
 }
 
