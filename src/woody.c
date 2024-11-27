@@ -111,8 +111,8 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
     new_phdr->p_memsz = 0x0000002b;
     new_phdr->p_filesz = 0x0000002b;
 
-    lseek(fd_new, 0, SEEK_END);
-    write(fd_new, new_phdr, sizeof(Elf64_Phdr));
+    // lseek(fd_new, 0, SEEK_END);
+    // write(fd_new, new_phdr, sizeof(Elf64_Phdr));
 }
 
 
@@ -143,7 +143,7 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     /* phnum * swap(ehdr->e_phentsize) = bytes de la Program Header Table */
 
     const char new_filename[] = "/home/carce_bo/42/woody-woodpacker/woody_out";
-    int fd_new = open(new_filename, O_CREAT | O_RDWR, 00644);
+    int fd_new = open(new_filename, O_CREAT | O_RDWR, 00744);
     if (fd_new == -1) {
         printf("Cannot open file \n");
     }
@@ -180,8 +180,7 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     // char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x14\x00\x00\x00\xba\x0a\x00\x00"
     //                  "\x00\x0f\x05\x49\xba\x42\x42\x42\x42\x42\x42\x42\x42\x41\xff\xe2"
     //                  "\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
-    //memcpy(&payload[20], (void*)ehdr->e_entry, sizeof(ehdr->e_entry));
-
+    //memcpy(&payload[20], (void*)ehdr->e_entry, sizeof(ehdr->e_entry));¡
 
     char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
 
@@ -191,23 +190,33 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
 
     /* change entrypoint*/
     printf("old_entrypoint = %lu\n", ehdr->e_entry);
-    lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
     Elf64_Addr new_entrypoint = new_phdr->p_vaddr;
     printf("new_entrypoint = %lu\n", new_entrypoint);
+    lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
     // write(fd_new, &new_entrypoint, sizeof(Elf64_Addr));
     /* change phnum */
-    lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
     Elf64_Half new_phnum = phnum + 1;
     printf("new_phnum = %lu\n", new_phnum);
-    write(fd_new, &new_phnum, sizeof(Elf64_Half));
+    lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
+    // write(fd_new, &new_phnum, sizeof(Elf64_Half));
     /* change offset of phtable */
-    lseek(fd_new, offsetof(Elf64_Ehdr, e_phoff), SEEK_SET);
     printf("new_phoff = %lu\n", size);
     Elf64_Off new_phoff = size;
+    lseek(fd_new, offsetof(Elf64_Ehdr, e_phoff), SEEK_SET);
     write(fd_new, &new_phoff, sizeof(Elf64_Off));
 
-    lseek(fd_new, new_phdr->p_offset, SEEK_SET);
-    write(fd_new, payload, sizeof(payload));
+    //last_phdr->p_offset
+
+    lseek(fd_new, size + offsetof(Elf64_Phdr, p_offset), SEEK_SET);
+    write(fd_new, &new_phoff, sizeof(Elf64_Off));
+
+
+    // lseek(fd_new, new_phdr->p_offset, SEEK_SET);
+    // write(fd_new, payload, sizeof(payload));
+
+
+
+    // Modificamos
 
     close(fd_new);
     free(new_phdr);
