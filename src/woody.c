@@ -91,15 +91,27 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
 
 # define PAYLOAD_SIZE 300
     new_phdr->p_flags += (PF_X | PF_W | PF_R);
+
+    // TODO seguramente, por culpa del align, esto tenga que tener padding respecto al final del
+    // archivo y por tanto, lo que dice tomás es cierto
     new_phdr->p_align = 0x1000;
     new_phdr->p_type = PT_LOAD;
     /* Si no cabe el payload */
-    if (phtable_size < PAYLOAD_SIZE) {
-        new_phdr->p_offset = size + phtable_size + ehdr->e_phentsize;
+    // if (phtable_size < PAYLOAD_SIZE) {
+        // Esto hace qque el nuevo phdr no este apuntado por nadie. Los phdr
+
+//         new_phdr->p_offset = size + phtable_size + ehdr->e_phentsize;
+
+        // Entonces el offset ha de ser de todo lo nuevo que metemos, porque nos
+        // estan apuntando desde ehdr y van a ir a buscar esto cuando tengan que
+        // loadear. Si no es loadeable lo que el ehdr apunta, esto eplota.
+
+        new_phdr->p_offset = size;
+
     /* Si cabe lo metemos en la anterior phtable.*/
-    } else {
-        new_phdr->p_offset = ehdr->e_phoff;
-    }
+    // } else {
+    //     new_phdr->p_offset = ehdr->e_phoff;
+    // }
     /* Alineamos nuestro vaddr con el vaddr mayor que hayamos encontrado. La operacion bitwise
      * es para que tenga 000 al final, alineado con las paginas de 4K.
      * Al final esto es para el alineamiento una vez se loadee el programa, realmente en el ELF,
@@ -108,11 +120,11 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
     new_phdr->p_vaddr = ((last->p_vaddr + last->p_memsz+new_phdr->p_align + 0xfff)) & (~0xfff);
     new_phdr->p_paddr = new_phdr->p_vaddr;
     /* Esto ya cuando sepa el payload amigo */
-    new_phdr->p_memsz = 0x0000002b;
-    new_phdr->p_filesz = 0x0000002b;
+    new_phdr->p_memsz = phtable_size + ehdr->e_phentsize + 0x0000002b;
+    new_phdr->p_filesz = phtable_size + ehdr->e_phentsize + 0x0000002b;
 
-    // lseek(fd_new, 0, SEEK_END);
-    // write(fd_new, new_phdr, sizeof(Elf64_Phdr));
+    lseek(fd_new, 0, SEEK_END);
+    write(fd_new, new_phdr, sizeof(Elf64_Phdr));
 }
 
 
@@ -180,9 +192,9 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     // char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x14\x00\x00\x00\xba\x0a\x00\x00"
     //                  "\x00\x0f\x05\x49\xba\x42\x42\x42\x42\x42\x42\x42\x42\x41\xff\xe2"
     //                  "\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
-    //memcpy(&payload[20], (void*)ehdr->e_entry, sizeof(ehdr->e_entry));¡
 
     char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
+    memcpy(&payload[20], (void*)ehdr->e_entry, sizeof(ehdr->e_entry));
 
     /* metemos el nuevo phdr que apunta al codigo infectado */
     Elf64_Phdr *new_phdr = malloc(sizeof(Elf64_Phdr));
@@ -198,7 +210,7 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     Elf64_Half new_phnum = phnum + 1;
     printf("new_phnum = %lu\n", new_phnum);
     lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
-    // write(fd_new, &new_phnum, sizeof(Elf64_Half));
+    write(fd_new, &new_phnum, sizeof(Elf64_Half));
     /* change offset of phtable */
     printf("new_phoff = %lu\n", size);
     Elf64_Off new_phoff = size;
@@ -210,9 +222,8 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     lseek(fd_new, size + offsetof(Elf64_Phdr, p_offset), SEEK_SET);
     write(fd_new, &new_phoff, sizeof(Elf64_Off));
 
-
-    // lseek(fd_new, new_phdr->p_offset, SEEK_SET);
-    // write(fd_new, payload, sizeof(payload));
+    lseek(fd_new, new_phdr->p_offset + phtable_size + ehdr->e_phentsize, SEEK_SET);
+    write(fd_new, payload, sizeof(payload));
 
 
 
