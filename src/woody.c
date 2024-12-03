@@ -89,6 +89,8 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
                       Elf64_Ehdr *ehdr, size_t size, Elf64_Half phtable_size)
 {
 
+    printf("phtable_size: %lx\n", phtable_size);
+
 # define PAYLOAD_SIZE 300
     new_phdr->p_flags += (PF_X | PF_W | PF_R);
 
@@ -106,7 +108,8 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
         // estan apuntando desde ehdr y van a ir a buscar esto cuando tengan que
         // loadear. Si no es loadeable lo que el ehdr apunta, esto eplota.
 
-        new_phdr->p_offset = size;
+        // Hace falta alinear el segmento igual que el resto de los LOAD
+        new_phdr->p_offset = (size + 0xfff) & (~0xfff);
 
     /* Si cabe lo metemos en la anterior phtable.*/
     // } else {
@@ -117,12 +120,13 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
      * Al final esto es para el alineamiento una vez se loadee el programa, realmente en el ELF,
      * (ESTO NO LO SE EXACTAMENTE), el tema de alineamiento no es tan importante.
      */
-    new_phdr->p_vaddr = ((last->p_vaddr + last->p_memsz+new_phdr->p_align + 0xfff)) & (~0xfff);
-    new_phdr->p_paddr = new_phdr->p_vaddr;
+    new_phdr->p_vaddr = ((last->p_vaddr + last->p_memsz + new_phdr->p_align)) & (~(new_phdr->p_align-1));
+    new_phdr->p_paddr = last->p_vaddr;
     /* Esto ya cuando sepa el payload amigo */
-    new_phdr->p_memsz = phtable_size + ehdr->e_phentsize + 0x0000002b;
-    new_phdr->p_filesz = phtable_size + ehdr->e_phentsize + 0x0000002b;
+    new_phdr->p_memsz = 0x5000;
+    new_phdr->p_filesz = 0x5000;
 
+    /* Copiamos el nuevo phdr al final de la phtable (previamente hemos copiado el resto) */
     lseek(fd_new, 0, SEEK_END);
     write(fd_new, new_phdr, sizeof(Elf64_Phdr));
 }
@@ -154,15 +158,23 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     Elf64_Half phtable_size = phnum * ehdr->e_phentsize;
     /* phnum * swap(ehdr->e_phentsize) = bytes de la Program Header Table */
 
-    const char new_filename[] = "/home/carce_bo/42/woody-woodpacker/woody_out";
+    const char new_filename[] = "/home/carce_bo/42/woody-woodpacker/_out";
     int fd_new = open(new_filename, O_CREAT | O_RDWR, 00744);
     if (fd_new == -1) {
         printf("Cannot open file \n");
     }
     write(fd_new, map, size);
+
     // printf("ehdr->e_shoff: %lx\n", ehdr->e_shoff);
     // printf("ehdr->e_shnum: %u\n", ehdr->e_shnum);
     // printf("ehdr->e_shentsize: %u\n", ehdr->e_shentsize);
+
+    // Siguiente chunk de 0x1000 es donde nosotros queremos apuntar
+    int padding = ((size + 0xfff) & (~0xfff)) - size;
+    printf("padding: %i\n", padding);
+    lseek(fd_new, 0, SEEK_END);
+    write(fd_new, (char[0x1000]){0,}, padding);
+
     for (Elf64_Half i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
         Elf64_Word sh_type = phdr->p_type;
@@ -193,8 +205,8 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     //                  "\x00\x0f\x05\x49\xba\x42\x42\x42\x42\x42\x42\x42\x42\x41\xff\xe2"
     //                  "\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
 
-    char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
-    memcpy(&payload[20], (void*)ehdr->e_entry, sizeof(ehdr->e_entry));
+    // char payload[] = "\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
+    // memcpy(&payload[20], (void*)ehdr->e_entry, sizeof(ehdr->e_entry));
 
     /* metemos el nuevo phdr que apunta al codigo infectado */
     Elf64_Phdr *new_phdr = malloc(sizeof(Elf64_Phdr));
@@ -206,28 +218,45 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     printf("new_entrypoint = %lu\n", new_entrypoint);
     lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
     // write(fd_new, &new_entrypoint, sizeof(Elf64_Addr));
+
     /* change phnum */
     Elf64_Half new_phnum = phnum + 1;
     printf("new_phnum = %lu\n", new_phnum);
     lseek(fd_new, offsetof(Elf64_Ehdr, e_phnum), SEEK_SET);
     write(fd_new, &new_phnum, sizeof(Elf64_Half));
-    /* change offset of phtable */
+
+    /* change offset of phtable in ehdr */
     printf("new_phoff = %lu\n", size);
-    Elf64_Off new_phoff = size;
+    Elf64_Off new_phoff = size + padding;
     lseek(fd_new, offsetof(Elf64_Ehdr, e_phoff), SEEK_SET);
     write(fd_new, &new_phoff, sizeof(Elf64_Off));
 
-    //last_phdr->p_offset
+    /* Change memsz, filesz, vaddr of the first phdr */
 
-    lseek(fd_new, size + offsetof(Elf64_Phdr, p_offset), SEEK_SET);
+    /* Ahora el filesz de los phdr será un pelin mas grande */
+    Elf64_Off new_filesz = phtable_size + ehdr->e_phentsize;
+    lseek(fd_new, size + padding + offsetof(Elf64_Phdr, p_filesz), SEEK_SET);
+    write(fd_new, &new_filesz, sizeof(Elf64_Xword));
+
+    lseek(fd_new, size + padding + offsetof(Elf64_Phdr, p_memsz), SEEK_SET);
+    write(fd_new, &new_filesz, sizeof(Elf64_Xword));
+
+    /* Y la vaddr la pongo donde puse el inicio del nuevo PT_LOAD. Así lo
+     * engloba todo y no tengo errores de que PHDR is not covered by LOAD section
+     */
+    Elf64_Addr new_vaddr = new_phdr->p_vaddr;
+    lseek(fd_new, size + padding + offsetof(Elf64_Phdr, p_vaddr), SEEK_SET);
+    write(fd_new, &new_vaddr, sizeof(Elf64_Addr));
+
+    lseek(fd_new, size + padding + offsetof(Elf64_Phdr, p_paddr), SEEK_SET);
+    write(fd_new, &new_vaddr, sizeof(Elf64_Addr));
+
+    /* Escribimos el nuevo offset en el phdr. */
+    lseek(fd_new, size + padding + offsetof(Elf64_Phdr, p_offset), SEEK_SET);
     write(fd_new, &new_phoff, sizeof(Elf64_Off));
 
-    lseek(fd_new, new_phdr->p_offset + phtable_size + ehdr->e_phentsize, SEEK_SET);
-    write(fd_new, payload, sizeof(payload));
-
-
-
-    // Modificamos
+    // lseek(fd_new, new_phdr->p_offset + phtable_size + ehdr->e_phentsize, SEEK_SET);
+    // write(fd_new, payload, sizeof(payload));
 
     close(fd_new);
     free(new_phdr);
