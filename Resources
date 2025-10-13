@@ -2,3 +2,28 @@ https://www.youtube.com/watch?v=0nWlx0smhRc
 https://fasterthanli.me/series/making-our-own-executable-packer/part-3#when-malloc-is-not-enough
 https://www.youtube.com/watch?v=bdNCcYddYEU
 https://www.youtube.com/watch?v=ZlZDWeVL2LI
+
+
+## Ideas
+Ya tenemos un ejecutable que lo que hace es añadir un nuevo program header a un binario ya existente, sin tocar nada más.
+
+# Qué hace woody?
+
+Woody tiene que cojer un programa, y cifrar sus PT_LOAD además de añadirle que
+imprima "...WOODY..." al principio de la ejecución.
+Cuando el programa fabricado por woody se ejecute, deberá:
+
+1. descrifrar su PT_LOAD
+
+Si tiene que descrifrar, tiene que haber 2 cosas inyectadas:
+- el codigo que desencripta
+- el desencriptador
+
+De forma ideal, woody debería tambier cifrar la impresion de woody. Tomas en el suyo lo que hace es tener un solo asm que imprime y se dispone a descifrar la .text
+section, despues de reapuntar hacia ese entrypoint al entrar.
+
+Por tanto, solo inyectaremos una cosa:
+- un asm que lo que haga sea imprimir "...WOODY..." y luego descifrar la parte del programa que se tenia que ejecutar en primer lugar.
+
+2. ejecutar el programa original
+Desde la linea de ejecucion anterior, llamar al programa incial y ez pz lm sqz
