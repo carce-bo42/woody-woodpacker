@@ -26,6 +26,26 @@ static int end = 0;
                     sizeof(p) == 4 ? __builtin_bswap32(p) : \
                                      __builtin_bswap16(p))
 
+#define IS_NOT_ELF(ehdr) (                           \
+    ((ehdr)->e_ident[EI_DATA] != ELFDATA2LSB         \
+      && (ehdr)->e_ident[EI_DATA] != ELFDATA2MSB)    \
+    || ehdr->e_ident[EI_VERSION] != EV_CURRENT       \
+    || swap(ehdr->e_ehsize) != sizeof(Elf64_Ehdr)    \
+    || swap(ehdr->e_shentsize) != sizeof(Elf64_Shdr) \
+)
+
+/*
+ * qsort hace el sort en orden ASCENDENTE 1 implica mayor que, -1 implica menor que.
+ *  1: p1->offset  < p2->p_offset
+ * -1: p1->offset  > p2->p_offset
+ *  0: p1->offset == p2->p_offset
+ */
+int _compare_elf_phdr(const void* phdr1, const void* phdr2) {
+    const Elf64_Phdr* p1 = *(const Elf64_Phdr**)phdr1;
+    const Elf64_Phdr* p2 = *(const Elf64_Phdr**)phdr2;
+    return (p1->p_offset < p2->p_offset) - (p1->p_offset > p2->p_offset);
+}
+
 /* See https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.eheader.html#elfid */
 static size_t get_ehdr_e_shnum(void* map, Elf64_Ehdr* ehdr) {
     if (ehdr->e_shnum >= SHN_LORESERVE) {
@@ -34,91 +54,20 @@ static size_t get_ehdr_e_shnum(void* map, Elf64_Ehdr* ehdr) {
     return swap(ehdr->e_shnum);
 }
 
-/*
- * Calcula cuanto mide el fichero elf buscando cual es el offset + tamaño
- * más grande que hay. De esta forma el orden dentro del fichero nos da igual.
- * See https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.intro.html
- */
-static size_t get_elf_size(void *map, Elf64_Ehdr *ehdr, size_t actual_size) {
-
-    size_t total = 0;
-    Elf64_Off phoff = swap(ehdr->e_phoff); /* Program Header Offset */
-    Elf64_Off shoff = swap(ehdr->e_shoff); /* Section Header Offset */
-    Elf64_Half shentsize = swap(ehdr->e_shentsize);
-    Elf64_Half phentsize = swap(ehdr->e_phentsize);
-    size_t shnum = get_ehdr_e_shnum(map, ehdr);
-    Elf64_Half phnum = swap(ehdr->e_phnum);
-
-    /* Most programs should be ok with this block */
-    if (phoff < shoff) {
-        total = shoff + shnum * shentsize;
-    } else {
-        total =  phoff + phnum * phentsize;
-    }
-    /* BUT this is not forbidden in the standard */
-    for (size_t i = 0; i < phnum; i++) {
-        if (phoff + i * phentsize > actual_size) {
-            return -1;
-        }
-        Elf64_Phdr *phent = map + phoff + i * phentsize;
-        Elf64_Off p_offset = swap(phent->p_offset);
-        Elf64_Xword p_filesz = swap(phent->p_filesz);
-        if (p_offset + p_filesz > total) {
-            total = p_offset + p_filesz;
-        }
-    }
-    for (size_t i = 0; i < shnum; i++) {
-        if (shoff + i * shentsize > actual_size) {
-            return -1;
-        }
-        Elf64_Shdr *shent = map + shoff + i * shentsize;
-        Elf64_Off sh_offset = swap(shent->sh_offset);
-        Elf64_Xword sh_size = swap(shent->sh_size);
-        if (sh_offset + sh_size > total) {
-            /* "A section of type SHT_NOBITS may have a non-zero size,
-             * but it occupies no space in the file." */
-            if (swap(shent->sh_type) != SHT_NOBITS ) {
-                total = sh_offset + sh_size;
-            }
-        }
-    }
-    return total;
-}
-
 void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
                       Elf64_Ehdr *ehdr, size_t size, Elf64_Half phtable_size)
 {
-
-    printf("phtable_size: %lx\n", phtable_size);
-
-# define PAYLOAD_SIZE 300
     new_phdr->p_flags += (PF_X | PF_W | PF_R);
 
     // TODO seguramente, por culpa del align, esto tenga que tener padding respecto al final del
     // archivo y por tanto, lo que dice tomás es cierto
     new_phdr->p_align = 0x1000;
     new_phdr->p_type = PT_LOAD;
-    /* Si no cabe el payload */
-    // if (phtable_size < PAYLOAD_SIZE) {
-        // Esto hace qque el nuevo phdr no este apuntado por nadie. Los phdr
 
-//         new_phdr->p_offset = size + phtable_size + ehdr->e_phentsize;
+    new_phdr->p_offset = (size + 0xfff) & (~0xfff);
 
-        // Entonces el offset ha de ser de todo lo nuevo que metemos, porque nos
-        // estan apuntando desde ehdr y van a ir a buscar esto cuando tengan que
-        // loadear. Si no es loadeable lo que el ehdr apunta, esto eplota.
-
-        // Hace falta alinear el segmento igual que el resto de los LOAD
-        new_phdr->p_offset = (size + 0xfff) & (~0xfff);
-
-    /* Si cabe lo metemos en la anterior phtable.*/
-    // } else {
-    //     new_phdr->p_offset = ehdr->e_phoff;
-    // }
     /* Alineamos nuestro vaddr con el vaddr mayor que hayamos encontrado. La operacion bitwise
      * es para que tenga 000 al final, alineado con las paginas de 4K.
-     * Al final esto es para el alineamiento una vez se loadee el programa, realmente en el ELF,
-     * (ESTO NO LO SE EXACTAMENTE), el tema de alineamiento no es tan importante.
      */
     new_phdr->p_vaddr = ((last->p_vaddr + last->p_memsz + new_phdr->p_align)) & (~(new_phdr->p_align-1));
     new_phdr->p_paddr = last->p_vaddr;
@@ -131,6 +80,10 @@ void prepare_new_phdr(int fd_new, Elf64_Phdr *new_phdr, Elf64_Phdr *last,
     write(fd_new, new_phdr, sizeof(Elf64_Phdr));
 }
 
+uint64_t get_multiple_of_alignments_needed(Elf64_Off alignment, uint64_t size) {
+    return size/alignment +1;
+}
+
 
 int do_woody(char* filename, int fd, void* map, size_t size) {
 
@@ -140,34 +93,87 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     /* static global, used in every swap */
     end = ehdr->e_ident[EI_DATA];
 
-    if ((ehdr->e_ident[EI_DATA] != ELFDATA2LSB
-            && ehdr->e_ident[EI_DATA] != ELFDATA2MSB)
-        || ehdr->e_ident[EI_VERSION] != EV_CURRENT
-        || swap(ehdr->e_ehsize) != sizeof(Elf64_Ehdr)
-        || swap(ehdr->e_shentsize) != sizeof(Elf64_Shdr)) {
+    if (IS_NOT_ELF(ehdr)) {
         return -1;
     }
 
     Elf64_Addr entrypoint = ehdr->e_entry;
     Elf64_Phdr *phtab = map + ehdr->e_phoff;    /* Program Header Table */
-    Elf64_Half phentsize = ehdr->e_phentsize;  /* Program Header Table entry size */
 
     phnum = ehdr->e_phnum;
-    Elf64_Phdr *last_phdr = NULL;
-    Elf64_Off max_poff_plus_size = 0;
-    Elf64_Half phtable_size = phnum * ehdr->e_phentsize;
+
     /* phnum * swap(ehdr->e_phentsize) = bytes de la Program Header Table */
 
-    const char new_filename[] = "/home/carce_bo/42/woody-woodpacker/_out";
+    char new_filename[100]={0};
+    sprintf(new_filename, "%s_out", filename);
+
     int fd_new = open(new_filename, O_CREAT | O_RDWR, 00744);
     if (fd_new == -1) {
         printf("Cannot open file \n");
     }
-    write(fd_new, map, size);
 
-    // printf("ehdr->e_shoff: %lx\n", ehdr->e_shoff);
-    // printf("ehdr->e_shnum: %u\n", ehdr->e_shnum);
-    // printf("ehdr->e_shentsize: %u\n", ehdr->e_shentsize);
+    // copiamos el fichero entero inicialmente
+    // TODO quizás separar en escrituras de tamaños de pagina para que esto
+    // no se suicide si el binario es gigantesco
+    write(fd_new, map, size);
+    Elf64_Phdr *text_phdr;
+
+    // Find the .text section
+    for (Elf64_Half i = 0; i < phnum; i++) {
+        Elf64_Phdr* phdr = &phtab[i];
+        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_W |PF_X)) {
+            text_phdr = phdr;
+            break;
+        }
+    }
+
+    // Modificamos todas las secciones que estén después de .text para dar espacio a ensanchar la .text.
+    // El tamaño que ensanchamos concuerda con un múltiple de la alineación de la .text, para evitar
+    // preocuparse del alineamiento en el resto de secciones que movamos: la .text section tiene el
+    // alineamiento más grande, suele estar en múltiples de páginas de 4Kb=4096b o 0x1000b.
+    Elf64_Off text_offset = text_phdr->p_offset;
+    Elf64_Xword orig_text_aligned_size = (text_phdr->p_filesz+ text_phdr->p_align - 1) & ~(text_phdr->p_align - 1);
+
+    // Pondremos el payload al final de la última página donde estuviese la .text original.
+    Elf64_Off payload_size = 4242;
+    Elf64_Off new_text_unaligned_size = orig_text_aligned_size + payload_size;
+
+    // Para saber donde acabará la .text section nueva y por tanto dónde empiezan las otras, tenemos que saber cuantas páginas más tenemos
+    // que añadir para que quepa el payload:
+    Elf64_Off new_aligned_size = (new_text_unaligned_size + text_phdr->p_align - 1) & ~(text_phdr->p_align -1);
+
+    // El delta que habremos movido el final de la seccion .text es:
+    Elf64_Off shift = new_aligned_size - orig_text_aligned_size;
+
+    // Reubicamos todas las secciones que no estaban dentro de .text originalmente.
+    // Movemos primero las secciones más altas en memoria para que no se sobrescriban los datos de las secciones posteriores.
+
+    // Primero recojemos los phdr que habrá que shiftear
+    Elf64_Off orig_text_end = text_phdr->p_offset + orig_text_aligned_size;
+    Elf64_Phdr *phdr_set[100] = {0};
+    int idx = 0;
+    for (Elf64_Half i = 0; i < phnum; i++) {
+        Elf64_Phdr* phdr = &phtab[i];
+        if (phdr->p_offset > orig_text_end) {
+            phdr_set[idx++] = phdr;
+        }
+    }
+
+    // Luego los ordenamos
+    qsort(phdr_set, (size_t)idx, sizeof(Elf64_Phdr *), _compare_elf_phdr);
+
+    // Comprobamos que estan en orden descenciente de offset:
+    for (int i=0; i < idx; i++) {
+        printf("%x\n", phdr_set[i]->p_offset);
+    }
+
+    /***************************************************************************** */
+    // basura antigua
+    exit(0);
+
+    Elf64_Phdr *last_phdr = NULL;
+    Elf64_Off max_poff_plus_size = 0;
+    Elf64_Half phtable_size = phnum * ehdr->e_phentsize;
 
     // Siguiente chunk de 0x1000 es donde nosotros queremos apuntar
     int padding = ((size + 0xfff) & (~0xfff)) - size;
@@ -175,10 +181,15 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     lseek(fd_new, 0, SEEK_END);
     write(fd_new, (char[0x1000]){0,}, padding);
 
+    Elf64_Off phentsize = 0;
     for (Elf64_Half i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = (void*)phtab + i*phentsize;
         Elf64_Word sh_type = phdr->p_type;
         //debug_program_header(map, size, phdr);
+        if (sh_type == PT_LOAD && phdr->p_flags & (PF_W |PF_X)) {
+
+
+        }
         if (phdr->p_offset + phdr->p_filesz > max_poff_plus_size) {
             max_poff_plus_size = phdr->p_offset + phdr->p_filesz;
         }
@@ -196,6 +207,8 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         lseek(fd_new, 0, SEEK_END);
         write(fd_new, phdr, phentsize);
     }
+
+    exit(0);
 
     printf("max_poff_plus_size = %x\n", max_poff_plus_size);
     printf("size = %x\n", size);
