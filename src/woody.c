@@ -127,6 +127,13 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         }
     }
 
+    /*
+     * Una vez un elf está construido, es completamente irrelevante la información de los section headers.
+     * Prueba de ello es lo que hace el binario strip. Aun así, sepamos que el binario dejemos estará
+     * claramente mal a ojos de herramientas de analisis estático, porque no vamos a borrar esas secciones,
+     * vamos a sobreescribirlas parcialmente.
+     */
+
     // Modificamos todas las secciones que estén después de .text para dar espacio a ensanchar la .text.
     // El tamaño que ensanchamos concuerda con un múltiple de la alineación de la .text, para evitar
     // preocuparse del alineamiento en el resto de secciones que movamos: la .text section tiene el
@@ -152,19 +159,37 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     Elf64_Off orig_text_end = text_phdr->p_offset + orig_text_aligned_size;
     Elf64_Phdr *phdr_set[100] = {0};
     int idx = 0;
+    Elf64_Off max_position = 0;
     for (Elf64_Half i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = &phtab[i];
         if (phdr->p_offset > orig_text_end) {
             phdr_set[idx++] = phdr;
+            /* Buscamos la última posición alineada que va a necesitar el ficherín */
+            Elf64_Off aligned_size = (phdr->p_filesz + phdr->p_align - 1) & ~(phdr->p_align - 1);
+            if (phdr->p_offset + aligned_size > max_position) {
+                max_position = phdr->p_offset + aligned_size;
+            }
         }
     }
 
-    // Luego los ordenamos
+    // Ensanchamos el tamaño del fichero de salida si vemos que nos faltará espacio incluso sobreescribiendo las secciones.
+    if (max_position + shift > size) {
+        lseek(fd_new, 0, SEEK_END);
+        write(fd_new, (char[0x1000]){0,}, max_position + shift - size);
+    }
+
     qsort(phdr_set, (size_t)idx, sizeof(Elf64_Phdr *), _compare_elf_phdr);
 
-    // Comprobamos que estan en orden descenciente de offset:
-    for (int i=0; i < idx; i++) {
-        printf("%x\n", phdr_set[i]->p_offset);
+    for (Elf64_Half i = 0; i < idx; i++) {
+        Elf64_Phdr* phdr = phdr_set[i];
+
+        // Copiamos el contenido de la seccion
+        lseek(fd_new, phdr->p_offset + shift, SEEK_SET);
+        write(fd_new, map + phdr->p_offset, phdr->p_filesz);
+
+        // Cambiamos el offset en la phtable
+        lseek(fd_new, ((void*)phdr - map) + offsetof(Elf64_Phdr, p_offset), SEEK_SET);
+        write(fd_new, &(Elf64_Off){phdr->p_offset + shift}, sizeof(Elf64_Off));
     }
 
     /***************************************************************************** */
