@@ -1,8 +1,4 @@
-section .data
-woody:
-    db "..WOODY..", 0x0a
 
-section .text
 global _start
 _start:
 
@@ -19,3 +15,6 @@ _start:
 
 	; mov r10, 0x4242424242424242   ; to be overriden
 	; jmp r10
+
+woody:
+	db "..WOODY..", 0x0a
