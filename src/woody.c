@@ -159,7 +159,7 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
      */
 
     const char payload[]="\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
-    if (sizeof(payload) < //expand_text_section_to_fit_payload(map, size, fd_new, text_phdr, sizeof(payload));
+    //expand_text_section_to_fit_payload(map, size, fd_new, text_phdr, sizeof(payload));
 
     // Inyectamos el código, y cambiamos el entrypoint
     lseek(fd_new, text_phdr->p_offset + text_phdr->p_filesz + 1, SEEK_SET);
