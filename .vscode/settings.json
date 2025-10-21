@@ -1,9 +1,0 @@
-{
-    "files.associations": {
-        "stat.h": "c",
-        "fcntl.h": "c",
-        "mman.h": "c",
-        "stddef.h": "c",
-        "stdio.h": "c"
-    }
-}
