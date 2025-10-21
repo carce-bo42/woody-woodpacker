@@ -43,11 +43,10 @@ static int end = 0;
 #define ALIGN(addr, alignment) (((addr)+(alignment)-1)&~((alignment)-1))
 
 typedef struct woodyCtx {
-    Elf64_Phdr **in_phdrs;
-    Elf64_Phdr **out_phdrs;
+    Elf64_Phdr *phtab;
     Elf64_Ehdr *elf_hdr;
-    Elf64_Phdr *in_text_phdr;
-    Elf64_Phdr *out_text_phdr;
+    Elf64_Phdr *text_phdr;
+    Elf64_Phdr *new_phdr;
 } woodyCtx;
 
 /*
@@ -78,7 +77,6 @@ int expand_text_section_to_fit_payload(void *map, size_t size, int fd, Elf64_Phd
     Elf64_Off max_position = 0;
     for (Elf64_Half i = 0; i < phnum; i++) {
         Elf64_Phdr* phdr = &phtab[i];
-
         if (phdr->p_offset >= text_phdr->p_offset + ALIGNED_SIZE(text_phdr)) {
             phdr_set[idx++] = phdr;
             /* Buscamos la última posición alineada que va a necesitar el ficherín */
@@ -113,93 +111,85 @@ int expand_text_section_to_fit_payload(void *map, size_t size, int fd, Elf64_Phd
     return 0;
 }
 
+int initialize_context(woodyCtx *ctx, void *map, size_t size) {
+
+    ctx->elf_hdr = map;
+    ctx->phtab = map + ctx->elf_hdr->e_phoff;
+
+    // Find the .text section
+    for (Elf64_Half i = 0; i < ctx->elf_hdr->e_phnum; i++) {
+        Elf64_Phdr* phdr = &ctx->phtab[i];
+        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R |PF_X)) {
+            ctx->text_phdr = phdr;
+        }
+    }
+
+    ctx->new_phdr = calloc(1,sizeof(Elf64_Phdr));
+    ctx->new_phdr->p_type = PT_LOAD;
+    ctx->new_phdr->p_flags = (PF_R |PF_X);
+    ctx->new_phdr->p_align = ctx->text_phdr->p_align;
+
+    return 0;
+}
+
 
 int do_woody(char* filename, int fd, void* map, size_t size) {
 
     Elf64_Ehdr *ehdr = map;          /* Elf Header */
     Elf64_Half phnum = -1;
+    woodyCtx *ctx = &(woodyCtx){0};
 
     /* static global, used in every swap */
     end = ehdr->e_ident[EI_DATA];
-
     if (IS_NOT_ELF(ehdr)) {
-        return -1;
+        return 1;
     }
 
-    Elf64_Phdr *phtab = map + ehdr->e_phoff;    /* Program Header Table */
-    phnum = ehdr->e_phnum;
+    initialize_context(ctx, map, size);
 
     char new_filename[100]={0};
     sprintf(new_filename, "%s_out", filename);
     int fd_new = open(new_filename, O_CREAT | O_RDWR, 00744);
     if (fd_new == -1) {
         printf("Cannot open file \n");
+        return 1;
     }
 
-    // copiamos el fichero entero inicialmente
-    // TODO quizás separar en escrituras de tamaños de pagina para que esto
-    // no se suicide si el binario es gigantesco
     write(fd_new, map, size);
-    Elf64_Phdr *text_phdr;
 
-    // Find the .text section
+    const char payload[]="\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
+
+    ctx->new_phdr->p_filesz = sizeof(payload);
+    ctx->new_phdr->p_memsz = sizeof(payload);
+    /* TODO toquetear aquí por si podemos insertar el programa en cualquier offset despues del phtable
+     * mientras cumpla p_offset % p_align == p_vaddr % p_align */
+    ctx->new_phdr->p_offset = ALIGN(
+        /* alineamos el final del archivo al alineamiento de la phtab*/
+        ALIGN(size, ctx->phtab->p_align) + sizeof(Elf64_Phdr) * (1 + ehdr->e_phnum),
+        /* alineamos el nuevo final del archivo al alineamiento del nuevo PT_LOAD */
+        ctx->new_phdr->p_align
+    );
+
+    /* Creamos espacio dentro del archivo para lo que vamos a escribir (esto podemos hacerlo luego cuando escribamos todo) */
+    fallocate(fd_new, FALLOC_FL_ZERO_RANGE, size, ALIGNED_SIZE(ctx->new_phdr) - size);
+
+    /* Buscamos la vaddr más alta entre los PT_LOAD. El nuevo PT_LOAD tendrá que estar por encima de estas,
+     * para garantizar que no sobreescribimos nada. */
+    Elf64_Addr max_vaddr = 0;
     for (Elf64_Half i = 0; i < phnum; i++) {
-        Elf64_Phdr* phdr = &phtab[i];
-        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_W |PF_X)) {
-            text_phdr = phdr;
-            break;
+        Elf64_Phdr* phdr = &ctx->phtab[i];
+        /* Usamos p_memsz en vez de filesz porque p_memsz >= p_filesz, (está en la spec de ELF) */
+        if (phdr->p_type == PT_LOAD && phdr->p_vaddr + phdr->p_memsz > max_vaddr ) {
+           max_vaddr = ALIGN(phdr->p_vaddr + phdr->p_memsz, phdr->p_align);
         }
     }
 
-    /*
-     * Una vez un elf está construido, es completamente irrelevante la información de los section headers.
-     * Prueba de ello es lo que hace el binario strip. Aun así, sepamos que el binario dejemos estará
-     * claramente mal a ojos de herramientas de analisis estático, porque no vamos a borrar esas secciones,
-     * vamos a sobreescribirlas parcialmente.
-     */
+    /* Esto debería estar alineado, asumimos que los PT_LOAD tienen todos el mismo align, o que, como mínimo
+     * el último tiene el mismo alineamiento que nosotros usamos. */
+    ctx->new_phdr->p_vaddr = max_vaddr;
 
-    const char payload[]="\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
-    //expand_text_section_to_fit_payload(map, size, fd_new, text_phdr, sizeof(payload));
-
-    // Inyectamos el código, y cambiamos el entrypoint
-    lseek(fd_new, text_phdr->p_offset + text_phdr->p_filesz + 1, SEEK_SET);
-    write(fd_new, payload, sizeof(payload));
-
-    Elf64_Addr injection_offset = text_phdr->p_vaddr + text_phdr->p_memsz + 1 ;
-    lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
-    write(fd_new, &injection_offset, sizeof(Elf64_Addr));
-
-    // Modificamos finalmente el filesz y el memsz de la .text section:
-    Elf64_Xword new_size = ALIGN(text_phdr->p_memsz + sizeof(payload), text_phdr->p_align);
-
-    // lseek(fd_new, (void*)&text_phdr->p_filesz - map, SEEK_SET);
-    // write(fd_new, &new_size, sizeof(Elf64_Xword));
-
-    // lseek(fd_new, (void*)&text_phdr->p_memsz - map, SEEK_SET);
-    // write(fd_new, &new_size, sizeof(Elf64_Xword));
-
-    // Escribimos nuestro payload
     exit(0);
 
-
-/*
-typedef struct {
-    unsigned char e_ident[16]; // 16 bytes
-    uint16_t e_type;           // 2 bytes
-    uint16_t e_machine;        // 2 bytes
-    uint32_t e_version;        // 4 bytes
-    uint64_t e_entry;          // 8 bytes
-    uint64_t e_phoff;          // 8 bytes
-    uint64_t e_shoff;          // 8 bytes
-    uint32_t e_flags;          // 4 bytes
-    uint16_t e_ehsize;         // 2 bytes
-    uint16_t e_phentsize;      // 2 bytes
-    uint16_t e_phnum;          // 2 bytes
-    uint16_t e_shentsize;      // 2 bytes
-    uint16_t e_shnum;          // 2 bytes
-    uint16_t e_shstrndx;       // 2 bytes
-} Elf64_Ehdr;
-*/
 
 }
 
