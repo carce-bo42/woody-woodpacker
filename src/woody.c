@@ -18,7 +18,9 @@
 #include <string.h>
 #include <stddef.h>
 
+#ifdef __woodydebug
 void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr);
+#endif
 
 /* Endianness of the binary */
 static int end = 0;
@@ -106,10 +108,6 @@ int expand_text_section_to_fit_payload(void *map, size_t size, int fd, Elf64_Phd
         lseek(fd, ((void*)phdr - map) + offsetof(Elf64_Phdr, p_offset), SEEK_SET);
         write(fd, &(Elf64_Off){phdr->p_offset + shift}, sizeof(Elf64_Off));
 
-        if (phdr->p_type == PT_LOAD) {
-
-        }
-
     }
 
     return 0;
@@ -161,24 +159,24 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
      */
 
     const char payload[]="\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
-    expand_text_section_to_fit_payload(map, size, fd_new, text_phdr, sizeof(payload));
+    if (sizeof(payload) < //expand_text_section_to_fit_payload(map, size, fd_new, text_phdr, sizeof(payload));
 
     // Inyectamos el código, y cambiamos el entrypoint
-    lseek(fd_new, text_phdr->p_offset + ALIGNED_SIZE(text_phdr), SEEK_SET);
+    lseek(fd_new, text_phdr->p_offset + text_phdr->p_filesz + 1, SEEK_SET);
     write(fd_new, payload, sizeof(payload));
 
-    Elf64_Addr injection_offset = text_phdr->p_vaddr + ALIGNED_SIZE(text_phdr);
+    Elf64_Addr injection_offset = text_phdr->p_vaddr + text_phdr->p_memsz + 1 ;
     lseek(fd_new, offsetof(Elf64_Ehdr, e_entry), SEEK_SET);
     write(fd_new, &injection_offset, sizeof(Elf64_Addr));
 
     // Modificamos finalmente el filesz y el memsz de la .text section:
-    Elf64_Xword new_size = ALIGN(ALIGNED_SIZE(text_phdr)+sizeof(payload), text_phdr->p_align);
+    Elf64_Xword new_size = ALIGN(text_phdr->p_memsz + sizeof(payload), text_phdr->p_align);
 
-    lseek(fd_new, (void*)&text_phdr->p_filesz - map, SEEK_SET);
-    write(fd_new, &new_size, sizeof(Elf64_Xword));
+    // lseek(fd_new, (void*)&text_phdr->p_filesz - map, SEEK_SET);
+    // write(fd_new, &new_size, sizeof(Elf64_Xword));
 
-    lseek(fd_new, (void*)&text_phdr->p_memsz - map, SEEK_SET);
-    write(fd_new, &new_size, sizeof(Elf64_Xword));
+    // lseek(fd_new, (void*)&text_phdr->p_memsz - map, SEEK_SET);
+    // write(fd_new, &new_size, sizeof(Elf64_Xword));
 
     // Escribimos nuestro payload
     exit(0);
@@ -269,6 +267,7 @@ int main(int argc,char** argv) {
 }
 
 
+#ifdef __woodydebug
 void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr) {
 
     (void*)map;
@@ -314,3 +313,4 @@ void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr) {
     printf("phdr->p_vaddr=%016lx\n", phdr->p_vaddr);
     printf("------------------------------------------------------------\n");
 }
+#endif
