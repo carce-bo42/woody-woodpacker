@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <stddef.h>
+#include <assert.h>
 
 #ifdef __woodydebug
 void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr);
@@ -43,10 +44,11 @@ static int end = 0;
 #define ALIGN(addr, alignment) (((addr)+(alignment)-1)&~((alignment)-1))
 
 typedef struct woodyCtx {
-    Elf64_Phdr *phtab;
+    Elf64_Phdr *phtab; /* Primer elemento del array de program headers */
     Elf64_Ehdr *elf_hdr;
-    Elf64_Phdr *text_phdr;
-    Elf64_Phdr *new_phdr;
+    Elf64_Phdr *phdr; /* PT_PHDR*/
+    Elf64_Phdr *text_phdr; /* PT_LOAD con PF_X|PF_R */
+    Elf64_Phdr *new_phdr; /* Nuevo PT_LOAD */
 } woodyCtx;
 
 /*
@@ -61,56 +63,6 @@ int _compare_elf_phdr(const void* phdr1, const void* phdr2) {
     return (p1->p_offset < p2->p_offset) - (p1->p_offset > p2->p_offset);
 }
 
-// Modificamos todas las secciones que estén después de .text para dar espacio a ensanchar la .text.
-// El tamaño que ensanchamos concuerda con un múltiple de la alineación de la .text, para evitar
-// preocuparse del alineamiento en el resto de secciones que movamos: la .text section tiene el
-// alineamiento más grande, suele estar en múltiples de páginas de 4Kb=4096b o 0x1000b.
-int expand_text_section_to_fit_payload(void *map, size_t size, int fd, Elf64_Phdr *text_phdr, size_t payload_size) {
-
-    Elf64_Phdr *phtab = map + ((Elf64_Ehdr*)map)->e_phoff;
-    Elf64_Half phnum = ((Elf64_Ehdr*)map)->e_phnum;
-
-    // Buscamos las secciones que tienen ubicadas después del final del chunk apuntado por
-    // el program header de la .text section: serán las que tengamos que mover.
-    Elf64_Phdr *phdr_set[100] = {0};
-    int idx = 0;
-    Elf64_Off max_position = 0;
-    for (Elf64_Half i = 0; i < phnum; i++) {
-        Elf64_Phdr* phdr = &phtab[i];
-        if (phdr->p_offset >= text_phdr->p_offset + ALIGNED_SIZE(text_phdr)) {
-            phdr_set[idx++] = phdr;
-            /* Buscamos la última posición alineada que va a necesitar el ficherín */
-            Elf64_Off aligned_size = ALIGNED_SIZE(phdr);
-            if (phdr->p_offset + aligned_size > max_position) {
-                max_position = phdr->p_offset + aligned_size;
-            }
-        }
-    }
-
-    // Ensanchamos el tamaño del fichero de salida si vemos que nos faltará espacio incluso sobreescribiendo las secciones.
-    Elf64_Off shift = ALIGN(ALIGNED_SIZE(text_phdr) + payload_size, text_phdr->p_align) - ALIGNED_SIZE(text_phdr);
-    if (max_position + shift > size) {
-        fallocate(fd, FALLOC_FL_ZERO_RANGE, size, shift);
-    }
-
-    qsort(phdr_set, (size_t)idx, sizeof(Elf64_Phdr *), _compare_elf_phdr);
-
-    for (Elf64_Half i = 0; i < idx; i++) {
-        Elf64_Phdr* phdr = phdr_set[i];
-
-        // Copiamos el contenido de la seccion
-        lseek(fd, phdr->p_offset + shift, SEEK_SET);
-        write(fd, map + phdr->p_offset, phdr->p_filesz);
-
-        // Cambiamos el offset en la phtable
-        lseek(fd, ((void*)phdr - map) + offsetof(Elf64_Phdr, p_offset), SEEK_SET);
-        write(fd, &(Elf64_Off){phdr->p_offset + shift}, sizeof(Elf64_Off));
-
-    }
-
-    return 0;
-}
-
 int initialize_context(woodyCtx *ctx, void *map, size_t size) {
 
     ctx->elf_hdr = map;
@@ -121,6 +73,9 @@ int initialize_context(woodyCtx *ctx, void *map, size_t size) {
         Elf64_Phdr* phdr = &ctx->phtab[i];
         if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R |PF_X)) {
             ctx->text_phdr = phdr;
+        }
+        if (phdr->p_type == PT_PHDR) {
+            ctx->phdr = phdr;
         }
     }
 
@@ -136,7 +91,6 @@ int initialize_context(woodyCtx *ctx, void *map, size_t size) {
 int do_woody(char* filename, int fd, void* map, size_t size) {
 
     Elf64_Ehdr *ehdr = map;          /* Elf Header */
-    Elf64_Half phnum = -1;
     woodyCtx *ctx = &(woodyCtx){0};
 
     /* static global, used in every swap */
@@ -155,28 +109,17 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         return 1;
     }
 
-    write(fd_new, map, size);
-
     const char payload[]="\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
 
-    ctx->new_phdr->p_filesz = sizeof(payload);
-    ctx->new_phdr->p_memsz = sizeof(payload);
-    /* TODO toquetear aquí por si podemos insertar el programa en cualquier offset despues del phtable
-     * mientras cumpla p_offset % p_align == p_vaddr % p_align */
-    ctx->new_phdr->p_offset = ALIGN(
-        /* alineamos el final del archivo al alineamiento de la phtab*/
-        ALIGN(size, ctx->phtab->p_align) + sizeof(Elf64_Phdr) * (1 + ehdr->e_phnum),
-        /* alineamos el nuevo final del archivo al alineamiento del nuevo PT_LOAD */
-        ctx->new_phdr->p_align
-    );
-
-    /* Creamos espacio dentro del archivo para lo que vamos a escribir (esto podemos hacerlo luego cuando escribamos todo) */
-    fallocate(fd_new, FALLOC_FL_ZERO_RANGE, size, ALIGNED_SIZE(ctx->new_phdr) - size);
+    /* HAcemos que el nuevo phdr esté contenido en la nueva seccion load, si no, falla. */
+    ctx->new_phdr->p_filesz = (sizeof(Elf64_Phdr) * (1 + ehdr->e_phnum)) + sizeof(payload);
+    ctx->new_phdr->p_memsz = ctx->new_phdr->p_filesz;
+    ctx->new_phdr->p_offset = ALIGN(size, ctx->new_phdr->p_align);
 
     /* Buscamos la vaddr más alta entre los PT_LOAD. El nuevo PT_LOAD tendrá que estar por encima de estas,
      * para garantizar que no sobreescribimos nada. */
     Elf64_Addr max_vaddr = 0;
-    for (Elf64_Half i = 0; i < phnum; i++) {
+    for (Elf64_Half i = 0; i < ctx->elf_hdr->e_phnum; i++) {
         Elf64_Phdr* phdr = &ctx->phtab[i];
         /* Usamos p_memsz en vez de filesz porque p_memsz >= p_filesz, (está en la spec de ELF) */
         if (phdr->p_type == PT_LOAD && phdr->p_vaddr + phdr->p_memsz > max_vaddr ) {
@@ -187,10 +130,43 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     /* Esto debería estar alineado, asumimos que los PT_LOAD tienen todos el mismo align, o que, como mínimo
      * el último tiene el mismo alineamiento que nosotros usamos. */
     ctx->new_phdr->p_vaddr = max_vaddr;
+    ctx->new_phdr->p_paddr = ctx->new_phdr->p_vaddr;
+
+    assert(ctx->new_phdr->p_offset % ctx->new_phdr->p_align == ctx->new_phdr->p_vaddr % ctx->new_phdr->p_align);
+
+    size_t original_phtab_size = sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum);
+
+    ctx->phdr->p_offset = ctx->new_phdr->p_offset; // Nuestra nueva seccion contiene al principio la phtab
+    ctx->phdr->p_filesz = original_phtab_size;
+    ctx->phdr->p_memsz = ctx->phdr->p_filesz;
+    /* La vaddr hay que cambiarla para que tenga sentido con el nuevo offset. Sin esto, eplota. */
+    ctx->phdr->p_vaddr = ctx->new_phdr->p_vaddr;
+
+    assert(ctx->phdr->p_offset % ctx->phdr->p_align == ctx->phdr->p_vaddr % ctx->phdr->p_align);
+
+    /* Modificamos el Elf header */
+    ctx->elf_hdr->e_phnum += 1;
+    ctx->elf_hdr->e_phoff = ctx->phdr->p_offset;
+    ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
+
+    /* Escribimos el contenido del fichero*/
+    write(fd_new, map, size);
+
+    /* Creamos espacio dentro del archivo para lo que vamos a escribir */
+    fallocate(fd_new, FALLOC_FL_ZERO_RANGE, size, ALIGNED_SIZE(ctx->new_phdr) - size);
+
+    /* Copiamos la phtable actual al final del fichero (-1 porque ya está sumado el nuevo PT_LOAD)*/
+    lseek(fd_new, ctx->phdr->p_offset, SEEK_SET);
+    write(fd_new, ctx->phtab, original_phtab_size);
+
+    /* Añadimos nuestro phdr */
+    write(fd_new, ctx->new_phdr, sizeof(Elf64_Phdr));
+
+    /* Escribimos el payload */
+    lseek(fd_new, ctx->new_phdr->p_offset + sizeof(Elf64_Phdr)*ctx->elf_hdr->e_phnum, SEEK_SET);
+    write(fd_new, payload, sizeof(payload));
 
     exit(0);
-
-
 }
 
 int woody_main(char* filename) {
@@ -206,7 +182,7 @@ int woody_main(char* filename) {
     if (fstat(fd, &st) == -1) {
         goto print_errno;
     }
-    if ((map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED) {
+    if ((map = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0)) == MAP_FAILED) {
         goto print_errno;
     }
     if (ft_strncmp((const char *)map, ELFMAG, SELFMAG)) {
