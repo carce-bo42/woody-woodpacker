@@ -41,11 +41,12 @@ $(LIBFT_DIR)/libft.a:
 
 .PHONY: clean fclean re
 
-clean:
+
+clena clnea claen clean:
 	make clean -C $(LIBFT_DIR)
 	rm -rf $(OBJ_DIR)/*.o
 
-fclean: clean
+fclena fclnea fclaen fclean: clean
 	make fclean -C $(LIBFT_DIR)
 	rm -f $(NAME)
 	rm -rf $(OBJ_DIR)

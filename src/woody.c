@@ -71,7 +71,7 @@ int initialize_context(woodyCtx *ctx, void *map, size_t size) {
     // Find the .text section
     for (Elf64_Half i = 0; i < ctx->elf_hdr->e_phnum; i++) {
         Elf64_Phdr* phdr = &ctx->phtab[i];
-        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R |PF_X)) {
+        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R | PF_W | PF_X)) {
             ctx->text_phdr = phdr;
         }
         if (phdr->p_type == PT_PHDR) {
@@ -87,32 +87,10 @@ int initialize_context(woodyCtx *ctx, void *map, size_t size) {
     return 0;
 }
 
-
-int do_woody(char* filename, int fd, void* map, size_t size) {
-
-    Elf64_Ehdr *ehdr = map;          /* Elf Header */
-    woodyCtx *ctx = &(woodyCtx){0};
-
-    /* static global, used in every swap */
-    end = ehdr->e_ident[EI_DATA];
-    if (IS_NOT_ELF(ehdr)) {
-        return 1;
-    }
-
-    initialize_context(ctx, map, size);
-
-    char new_filename[100]={0};
-    sprintf(new_filename, "%s_out", filename);
-    int fd_new = open(new_filename, O_CREAT | O_RDWR, 00744);
-    if (fd_new == -1) {
-        printf("Cannot open file \n");
-        return 1;
-    }
-
-    const char payload[]="\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
+static void set_new_program_header(woodyCtx *ctx, size_t size, size_t sz_payload) {
 
     /* HAcemos que el nuevo phdr esté contenido en la nueva seccion load, si no, falla. */
-    ctx->new_phdr->p_filesz = (sizeof(Elf64_Phdr) * (1 + ehdr->e_phnum)) + sizeof(payload);
+    ctx->new_phdr->p_filesz = (sizeof(Elf64_Phdr) * (1 + ctx->elf_hdr->e_phnum)) + sizeof(sz_payload);
     ctx->new_phdr->p_memsz = ctx->new_phdr->p_filesz;
     ctx->new_phdr->p_offset = ALIGN(size, ctx->new_phdr->p_align);
 
@@ -133,6 +111,9 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     ctx->new_phdr->p_paddr = ctx->new_phdr->p_vaddr;
 
     assert(ctx->new_phdr->p_offset % ctx->new_phdr->p_align == ctx->new_phdr->p_vaddr % ctx->new_phdr->p_align);
+}
+
+static void patch_phdr(woodyCtx *ctx) {
 
     size_t original_phtab_size = sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum);
 
@@ -148,6 +129,65 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     ctx->elf_hdr->e_phnum += 1;
     ctx->elf_hdr->e_phoff = ctx->phdr->p_offset;
     ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
+}
+
+
+int do_woody(char* filename, int fd, void* map, size_t size) {
+
+    Elf64_Ehdr *ehdr = map;          /* Elf Header */
+    woodyCtx *ctx = &(woodyCtx){0};
+
+    /* static global, used in every swap */
+    end = ehdr->e_ident[EI_DATA];
+    if (IS_NOT_ELF(ehdr)) {
+        return 1;
+    }
+
+    initialize_context(ctx, map, size);
+
+    char new_filename[100]={0};
+    sprintf(new_filename, "%s_out", filename);
+    int fd_new = open("woody_out", O_CREAT | O_RDWR, 00744);
+    if (fd_new == -1) {
+        printf("Cannot open file \n");
+        return 1;
+    }
+
+    const char payload[]=
+        "\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d"
+        "\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05"
+        "\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e"
+        "\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
+
+    set_new_program_header(ctx, size, sizeof(payload));
+    patch_phdr(ctx);
+
+    /* Si el binario está stripped, no tenemos forma de saber el tamaño de .text. En teoría, muy en teoría,
+     * se podría parsear PT_DYNAMIC para quitar los trozos de la PT_LOAD con PF_X|PF_R que se indican en los
+     * DT_RELA, DT_FINI, DT_INIT, DT_PLTREL etc.
+     * Es un curro que no voy a hacer, si me das un binario stripped, este método no funciona.
+     */
+
+    /* Buscamos la seccion que vamos a cifrar, la .text. Cifrar otras secciones del PT_LOAD pueden cargarse la carga dinámica.
+     * Sobretodo: .plt.got y las .rela */
+    Elf64_Shdr *shdr = map + ctx->elf_hdr->e_shoff;
+    if ((char*)shdr - (char*)map > size) {
+        fprintf(stderr, "Unable to retrieve .text section from program headers");
+        return 1;
+    }
+    Elf64_Shdr *shstrtab = &shdr[ctx->elf_hdr->e_shstrndx];
+    Elf64_Shdr *text_shdr = NULL;
+    for (int i=0; i < ctx->elf_hdr->e_shnum; i++) {
+        Elf64_Shdr *_shdr = &shdr[i];
+        if (_shdr->sh_type == SHT_PROGBITS &&
+            !strncmp(".text", map+shstrtab->sh_offset+_shdr->sh_name, strlen(".text")+1)) {
+            text_shdr = _shdr;
+            break;
+        }
+    }
+    /* Aqui tenemos la .text section para poder cifrarla */
+
+    printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx", text_shdr->sh_offset, text_shdr->sh_addr, text_shdr->sh_size);
 
     /* Escribimos el contenido del fichero*/
     write(fd_new, map, size);
@@ -157,7 +197,7 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
 
     /* Copiamos la phtable actual al final del fichero (-1 porque ya está sumado el nuevo PT_LOAD)*/
     lseek(fd_new, ctx->phdr->p_offset, SEEK_SET);
-    write(fd_new, ctx->phtab, original_phtab_size);
+    write(fd_new, ctx->phtab, sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum-1));
 
     /* Añadimos nuestro phdr */
     write(fd_new, ctx->new_phdr, sizeof(Elf64_Phdr));
