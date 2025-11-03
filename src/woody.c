@@ -131,6 +131,12 @@ static void patch_phdr(woodyCtx *ctx) {
     ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
 }
 
+void encrypt(const char key[48], char *pt, size_t pt_sz, char *ct, size_t ct_sz) {
+    for (int i=0; i < pt_sz; i++) {
+        *ct = *pt ^ key[i%sizeof(key)];
+    }
+}
+
 
 int do_woody(char* filename, int fd, void* map, size_t size) {
 
