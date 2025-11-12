@@ -49,7 +49,7 @@ typedef struct woodyCtx {
     Elf64_Phdr *phdr; /* PT_PHDR*/
     Elf64_Phdr *text_phdr; /* PT_LOAD con PF_X|PF_R */
     Elf64_Phdr *new_phdr; /* Nuevo PT_LOAD */
-    char key[32];
+    uint8_t key[32];
     Elf64_Shdr *text_shdr;
 } woodyCtx;
 
@@ -170,6 +170,7 @@ static void patch_phdr(woodyCtx *ctx) {
     /* Modificamos el Elf header */
     ctx->elf_hdr->e_phnum += 1;
     ctx->elf_hdr->e_phoff = ctx->phdr->p_offset;
+    printf("initial entrypoint: %lx\n", ctx->elf_hdr->e_entry);
     ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
 }
 
@@ -182,14 +183,13 @@ void encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
 
     /* Cifrar otras secciones del PT_LOAD rompe la carga dinámica en la mayoría de los casos.
      */
-    // printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx", ctx->text_shdr->sh_offset, ctx->text_shdr->sh_addr, ctx->text_shdr->sh_size);
 
     /* Ciframos con un simple xor byte a byte */
     get_random_key(ctx->key, sizeof(ctx->key));
     size_t total_text_len = ctx->text_shdr->sh_size;
     char *mem = (char*)map + ctx->text_shdr->sh_offset;
     for (int i=0; i < total_text_len; i++) {
-        mem[i] ^= ctx->key[i&(0xff>>2)];
+        mem[i] ^= ctx->key[i&(0xff>>3)];
     }
 
     /* Cambiamos los permisos del PT_LOAD que contiene el .text para poder descrifrar en la carga */
@@ -255,10 +255,19 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     memcpy(p, &ctx->text_shdr->sh_size, sizeof(Elf64_Xword));
     p += sizeof(Elf64_Xword);
 
-    memcpy(p, &ctx->new_phdr->p_vaddr, sizeof(Elf64_Addr));
+    /* La vaddr donde esté el shellcode es el p_vaddr + sizeof(todos los program headers) */
+    Elf64_Addr shellcode_vaddr = ctx->new_phdr->p_vaddr + sizeof(Elf64_Phdr)*ctx->elf_hdr->e_phnum;
+    memcpy(p, &shellcode_vaddr, sizeof(Elf64_Addr));
     p += sizeof(Elf64_Addr);
 
     memcpy(p, ctx->key, sizeof(ctx->key));
+
+    printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx\n", ctx->text_shdr->sh_offset, ctx->text_shdr->sh_addr, ctx->text_shdr->sh_size);
+    printf("key=");
+    for (int i=0; i<sizeof(ctx->key); i++) {
+        printf("%02x", ctx->key[i]);
+    }
+    printf("\n");
 
     /* Escribimos el contenido del fichero*/
     _write(fd_new, map, size);
