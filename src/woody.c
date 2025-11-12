@@ -80,12 +80,29 @@ static int _write(int fd, const void *buf, size_t len) {
 static int initialize_context(woodyCtx *ctx, void *map, size_t size) {
 
     ctx->elf_hdr = map;
-    ctx->phtab = map + ctx->elf_hdr->e_phoff;
+    Elf64_Shdr *shdr = (Elf64_Shdr *)((char*)map + ctx->elf_hdr->e_shoff);
+    if ((char*)shdr - (char*)map > size) {
+        fprintf(stderr, "Unable to retrieve .text section from program headers");
+        return 1;
+    }
+    Elf64_Shdr *shstrtab = &shdr[ctx->elf_hdr->e_shstrndx];
+    for (int i=0; i < ctx->elf_hdr->e_shnum; i++) {
+        Elf64_Shdr *_shdr = &shdr[i];
+        if (_shdr->sh_type == SHT_PROGBITS &&
+            !strncmp(".text", map+shstrtab->sh_offset+_shdr->sh_name, strlen(".text")+1)) {
+            ctx->text_shdr = _shdr;
+            break;
+        }
+    }
 
+    ctx->phtab = map + ctx->elf_hdr->e_phoff;
     // Find the .text section
     for (Elf64_Half i = 0; i < ctx->elf_hdr->e_phnum; i++) {
         Elf64_Phdr* phdr = &ctx->phtab[i];
-        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R | PF_X)) {
+        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R | PF_X)
+            /* De estos PT_LOAD pueden haber varios, buscamos el que contiene el .text */
+            && phdr->p_offset <= ctx->text_shdr->sh_offset
+            && phdr->p_offset + phdr->p_filesz >= ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size) {
             ctx->text_phdr = phdr;
         }
         if (phdr->p_type == PT_PHDR) {
@@ -161,33 +178,15 @@ int get_random_key(char *key, size_t key_len) {
     read(fd, key, key_len);
 }
 
-void encrypt_text_section(woodyCtx *ctx, size_t size) {
+void encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
 
-    /* Buscamos la seccion que vamos a cifrar, la .text. Cifrar otras secciones del PT_LOAD rompe la carga dinámica en
-     * la mayoría de los casos.
+    /* Cifrar otras secciones del PT_LOAD rompe la carga dinámica en la mayoría de los casos.
      */
-    void *map = (void*)ctx->elf_hdr;
-    Elf64_Shdr *shdr = (Elf64_Shdr *)((char*)map + ctx->elf_hdr->e_shoff);
-    if ((char*)shdr - (char*)map > size) {
-        fprintf(stderr, "Unable to retrieve .text section from program headers");
-        return;
-    }
-    Elf64_Shdr *shstrtab = &shdr[ctx->elf_hdr->e_shstrndx];
-    for (int i=0; i < ctx->elf_hdr->e_shnum; i++) {
-        Elf64_Shdr *_shdr = &shdr[i];
-        if (_shdr->sh_type == SHT_PROGBITS &&
-            !strncmp(".text", map+shstrtab->sh_offset+_shdr->sh_name, strlen(".text")+1)) {
-            ctx->text_shdr = _shdr;
-            break;
-        }
-    }
-
-    /* Aqui tenemos la .text section para poder cifrarla */
-    printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx", ctx->text_shdr->sh_offset, ctx->text_shdr->sh_addr, ctx->text_shdr->sh_size);
+    // printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx", ctx->text_shdr->sh_offset, ctx->text_shdr->sh_addr, ctx->text_shdr->sh_size);
 
     /* Ciframos con un simple xor byte a byte */
     get_random_key(ctx->key, sizeof(ctx->key));
-    size_t total_text_len = ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size;
+    size_t total_text_len = ctx->text_shdr->sh_size;
     char *mem = (char*)map + ctx->text_shdr->sh_offset;
     for (int i=0; i < total_text_len; i++) {
         mem[i] ^= ctx->key[i&(0xff>>2)];
@@ -195,7 +194,14 @@ void encrypt_text_section(woodyCtx *ctx, size_t size) {
 
     /* Cambiamos los permisos del PT_LOAD que contiene el .text para poder descrifrar en la carga */
     ctx->text_phdr->p_flags = (PF_R | PF_W | PF_X);
+}
 
+static int print_mem(const char *mem, size_t size) {
+
+    for (int i=0; i < size; i++) {
+        printf("%x", mem[i]);
+    }
+    printf("\n");
 }
 
 
@@ -238,10 +244,10 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     // TODO hacer algo con estos magic numbers
     set_new_program_header(ctx, size, sizeof(payload)-1+(8*3)+32);
     patch_phdr(ctx);
-    encrypt_text_section(ctx, size);
+    encrypt_text_section(ctx, map, size);
 
     /* Parcheamos el shellcode */
-    char *p = &payload[sizeof(payload)-(8*3)-32];
+    char *p = &payload[sizeof(payload)-(8*3)-32-1];
 
     memcpy(p, &ctx->text_shdr->sh_addr, sizeof(Elf64_Addr));
     p += sizeof(Elf64_Addr);
@@ -280,6 +286,8 @@ int woody_main(char* filename) {
     struct stat st;
     int ret = 0;
     void* map = MAP_FAILED;
+
+
 
     if ((fd = open(filename, O_RDONLY | O_NONBLOCK)) == -1) {
         goto print_errno;
@@ -325,6 +333,8 @@ cleanup:
 }
 
 int main(int argc,char** argv) {
+
+    //sleep(10000);
 
     char filename[4096] = {0};
 
