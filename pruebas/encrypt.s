@@ -1,8 +1,8 @@
 
 global _start
 
-#https://math.hws.edu/eck/cs220/f22/registers.html
-#https://stackoverflow.com/questions/2030366/what-do-the-brackets-mean-in-nasm-syntax-for-x86-asm
+; https://math.hws.edu/eck/cs220/f22/registers.html
+; https://stackoverflow.com/questions/2030366/what-do-the-brackets-mean-in-nasm-syntax-for-x86-asm
 _start:
 
     mov rax, 1               ; syscall write

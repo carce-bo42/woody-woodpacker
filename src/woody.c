@@ -49,21 +49,35 @@ typedef struct woodyCtx {
     Elf64_Phdr *phdr; /* PT_PHDR*/
     Elf64_Phdr *text_phdr; /* PT_LOAD con PF_X|PF_R */
     Elf64_Phdr *new_phdr; /* Nuevo PT_LOAD */
+    char key[32];
+    Elf64_Shdr *text_shdr;
 } woodyCtx;
 
-/*
- * qsort hace el sort en orden ASCENDENTE 1 implica mayor que, -1 implica menor que.
- *  1: p1->offset  < p2->p_offset
- * -1: p1->offset  > p2->p_offset
- *  0: p1->offset == p2->p_offset
- */
-int _compare_elf_phdr(const void* phdr1, const void* phdr2) {
-    const Elf64_Phdr* p1 = *(const Elf64_Phdr**)phdr1;
-    const Elf64_Phdr* p2 = *(const Elf64_Phdr**)phdr2;
-    return (p1->p_offset < p2->p_offset) - (p1->p_offset > p2->p_offset);
+
+static int _write(int fd, const void *buf, size_t len) {
+
+    size_t total_written = 0;
+    const char *p = (const char *)buf;
+
+    while (total_written < len) {
+        ssize_t bytes_written = write(fd, p + total_written, len - total_written);
+        if (bytes_written == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (bytes_written == 0) {
+            break;
+        }
+        total_written += bytes_written;
+    }
+
+    return 0;
 }
 
-int initialize_context(woodyCtx *ctx, void *map, size_t size) {
+
+static int initialize_context(woodyCtx *ctx, void *map, size_t size) {
 
     ctx->elf_hdr = map;
     ctx->phtab = map + ctx->elf_hdr->e_phoff;
@@ -71,7 +85,7 @@ int initialize_context(woodyCtx *ctx, void *map, size_t size) {
     // Find the .text section
     for (Elf64_Half i = 0; i < ctx->elf_hdr->e_phnum; i++) {
         Elf64_Phdr* phdr = &ctx->phtab[i];
-        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R | PF_W | PF_X)) {
+        if (phdr->p_type == PT_LOAD && phdr->p_flags & (PF_R | PF_X)) {
             ctx->text_phdr = phdr;
         }
         if (phdr->p_type == PT_PHDR) {
@@ -87,6 +101,10 @@ int initialize_context(woodyCtx *ctx, void *map, size_t size) {
     return 0;
 }
 
+
+/*
+ * Crea un Elf64_Phdr de la sección donde insertaremos el shellcode.
+ */
 static void set_new_program_header(woodyCtx *ctx, size_t size, size_t sz_payload) {
 
     /* HAcemos que el nuevo phdr esté contenido en la nueva seccion load, si no, falla. */
@@ -113,6 +131,13 @@ static void set_new_program_header(woodyCtx *ctx, size_t size, size_t sz_payload
     assert(ctx->new_phdr->p_offset % ctx->new_phdr->p_align == ctx->new_phdr->p_vaddr % ctx->new_phdr->p_align);
 }
 
+
+/*
+ * Modifica el Elf64_Phdr de tipo PT_PHDR (la program header table) para que apunte donde situaremos la nueva
+ * program header table, que tendrá un phdr nuevo, el de nuestra sección con el shellcode.
+ * Por razones místicas el program header tiene que ser loadeado también en memoria. Así que la nueva sección,
+ * contendrá en su inicio la nueva program header table, y luego, alineado a , el shellcode.
+ */
 static void patch_phdr(woodyCtx *ctx) {
 
     size_t original_phtab_size = sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum);
@@ -131,10 +156,46 @@ static void patch_phdr(woodyCtx *ctx) {
     ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
 }
 
-void encrypt(const char key[48], char *pt, size_t pt_sz, char *ct, size_t ct_sz) {
-    for (int i=0; i < pt_sz; i++) {
-        *ct = *pt ^ key[i%sizeof(key)];
+int get_random_key(char *key, size_t key_len) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    read(fd, key, key_len);
+}
+
+void encrypt_text_section(woodyCtx *ctx, size_t size) {
+
+    /* Buscamos la seccion que vamos a cifrar, la .text. Cifrar otras secciones del PT_LOAD rompe la carga dinámica en
+     * la mayoría de los casos.
+     */
+    void *map = (void*)ctx->elf_hdr;
+    Elf64_Shdr *shdr = (Elf64_Shdr *)((char*)map + ctx->elf_hdr->e_shoff);
+    if ((char*)shdr - (char*)map > size) {
+        fprintf(stderr, "Unable to retrieve .text section from program headers");
+        return;
     }
+    Elf64_Shdr *shstrtab = &shdr[ctx->elf_hdr->e_shstrndx];
+    for (int i=0; i < ctx->elf_hdr->e_shnum; i++) {
+        Elf64_Shdr *_shdr = &shdr[i];
+        if (_shdr->sh_type == SHT_PROGBITS &&
+            !strncmp(".text", map+shstrtab->sh_offset+_shdr->sh_name, strlen(".text")+1)) {
+            ctx->text_shdr = _shdr;
+            break;
+        }
+    }
+
+    /* Aqui tenemos la .text section para poder cifrarla */
+    printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx", ctx->text_shdr->sh_offset, ctx->text_shdr->sh_addr, ctx->text_shdr->sh_size);
+
+    /* Ciframos con un simple xor byte a byte */
+    get_random_key(ctx->key, sizeof(ctx->key));
+    size_t total_text_len = ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size;
+    char *mem = (char*)map + ctx->text_shdr->sh_offset;
+    for (int i=0; i < total_text_len; i++) {
+        mem[i] ^= ctx->key[i&(0xff>>2)];
+    }
+
+    /* Cambiamos los permisos del PT_LOAD que contiene el .text para poder descrifrar en la carga */
+    ctx->text_phdr->p_flags = (PF_R | PF_W | PF_X);
+
 }
 
 
@@ -159,58 +220,56 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         return 1;
     }
 
-    const char payload[]=
-        "\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d"
-        "\x35\x11\x00\x00\x00\xba\x0a\x00\x00\x00\x0f\x05"
-        "\xb8\x3c\x00\x00\x00\x48\x31\xff\x0f\x05\x2e\x2e"
-        "\x57\x4f\x4f\x44\x59\x2e\x2e\x0a";
+    char payload[]=
+"\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35\x57\x00\x00"
+"\x00\xba\x0e\x00\x00\x00\x0f\x05\x48\x8d\x0d\xe1\xff\xff\xff\x4c"
+"\x8b\x05\x60\x00\x00\x00\x4c\x29\xc1\x4c\x8b\x05\x46\x00\x00\x00"
+"\x49\x01\xc8\x4c\x89\xc6\x48\x89\xf2\x48\x03\x15\x3e\x00\x00\x00"
+"\x48\x8d\x0d\x47\x00\x00\x00\x48\x31\xc0\x48\x39\xd6\x74\x16\x48"
+"\x83\xe0\x1f\x48\x8d\x3c\x01\x44\x8a\x0f\x44\x30\x0e\x48\xff\xc0"
+"\x48\xff\xc6\xeb\xe5\x41\xff\xe0\x2e\x2e\x2e\x2e\x57\x4f\x4f\x44"
+"\x59\x2e\x2e\x2e\x2e\x0a"
+"\x11\x11\x11\x11\x11\x11\x11\x11" // => ciphertext start vaddr
+"\x22\x22\x22\x22\x22\x22\x22\x22" //=> ciphertext size
+"\x33\x33\x33\x33\x33\x33\x33\x33" // => vaddr of the shellcode
+"\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44" // => key
+"\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44";
 
-    set_new_program_header(ctx, size, sizeof(payload));
+    // TODO hacer algo con estos magic numbers
+    set_new_program_header(ctx, size, sizeof(payload)-1+(8*3)+32);
     patch_phdr(ctx);
+    encrypt_text_section(ctx, size);
 
-    /* Si el binario está stripped, no tenemos forma de saber el tamaño de .text. En teoría, muy en teoría,
-     * se podría parsear PT_DYNAMIC para quitar los trozos de la PT_LOAD con PF_X|PF_R que se indican en los
-     * DT_RELA, DT_FINI, DT_INIT, DT_PLTREL etc.
-     * Es un curro que no voy a hacer, si me das un binario stripped, este método no funciona.
-     */
+    /* Parcheamos el shellcode */
+    char *p = &payload[sizeof(payload)-(8*3)-32];
 
-    /* Buscamos la seccion que vamos a cifrar, la .text. Cifrar otras secciones del PT_LOAD pueden cargarse la carga dinámica.
-     * Sobretodo: .plt.got y las .rela */
-    Elf64_Shdr *shdr = map + ctx->elf_hdr->e_shoff;
-    if ((char*)shdr - (char*)map > size) {
-        fprintf(stderr, "Unable to retrieve .text section from program headers");
-        return 1;
-    }
-    Elf64_Shdr *shstrtab = &shdr[ctx->elf_hdr->e_shstrndx];
-    Elf64_Shdr *text_shdr = NULL;
-    for (int i=0; i < ctx->elf_hdr->e_shnum; i++) {
-        Elf64_Shdr *_shdr = &shdr[i];
-        if (_shdr->sh_type == SHT_PROGBITS &&
-            !strncmp(".text", map+shstrtab->sh_offset+_shdr->sh_name, strlen(".text")+1)) {
-            text_shdr = _shdr;
-            break;
-        }
-    }
-    /* Aqui tenemos la .text section para poder cifrarla */
+    memcpy(p, &ctx->text_shdr->sh_addr, sizeof(Elf64_Addr));
+    p += sizeof(Elf64_Addr);
 
-    printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx", text_shdr->sh_offset, text_shdr->sh_addr, text_shdr->sh_size);
+    memcpy(p, &ctx->text_shdr->sh_size, sizeof(Elf64_Xword));
+    p += sizeof(Elf64_Xword);
+
+    memcpy(p, &ctx->new_phdr->p_vaddr, sizeof(Elf64_Addr));
+    p += sizeof(Elf64_Addr);
+
+    memcpy(p, ctx->key, sizeof(ctx->key));
 
     /* Escribimos el contenido del fichero*/
-    write(fd_new, map, size);
+    _write(fd_new, map, size);
 
     /* Creamos espacio dentro del archivo para lo que vamos a escribir */
     fallocate(fd_new, FALLOC_FL_ZERO_RANGE, size, ALIGNED_SIZE(ctx->new_phdr) - size);
 
     /* Copiamos la phtable actual al final del fichero (-1 porque ya está sumado el nuevo PT_LOAD)*/
     lseek(fd_new, ctx->phdr->p_offset, SEEK_SET);
-    write(fd_new, ctx->phtab, sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum-1));
+    _write(fd_new, ctx->phtab, sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum-1));
 
     /* Añadimos nuestro phdr */
-    write(fd_new, ctx->new_phdr, sizeof(Elf64_Phdr));
+    _write(fd_new, ctx->new_phdr, sizeof(Elf64_Phdr));
 
     /* Escribimos el payload */
     lseek(fd_new, ctx->new_phdr->p_offset + sizeof(Elf64_Phdr)*ctx->elf_hdr->e_phnum, SEEK_SET);
-    write(fd_new, payload, sizeof(payload));
+    _write(fd_new, payload, sizeof(payload));
 
     exit(0);
 }
