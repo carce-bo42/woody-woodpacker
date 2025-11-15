@@ -5,6 +5,10 @@ global _start
 ; https://stackoverflow.com/questions/2030366/what-do-the-brackets-mean-in-nasm-syntax-for-x86-asm
 _start:
 
+    push rdi        ; argc
+    push rsi        ; argv
+    push rdx        ; envp
+
     mov rax, 1               ; syscall write
     mov rdi, 1               ; 1st arg: fd = 1
     lea rsi, [rel woody_str] ; load effective address of woody string
@@ -59,6 +63,9 @@ _decrypt_loop:
     jmp _loop_step
 
 _done:
+    pop rdx             ; envp
+    pop rsi             ; argv
+    pop rdi             ; argc
     ; give control to initial entrypoint (start of unencrypted .text section)
     jmp r8
 
