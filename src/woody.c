@@ -275,9 +275,11 @@ static int get_random_key(uint8_t *key, size_t key_len) {
 
     /* Si no puedo leer 32 bytes de un fichero algo esta muy muy pocho */
     if (read(fd, key, key_len) != (ssize_t)key_len) {
+		close(fd);
         return ERR_EXTLIB_CALL;
     }
 
+	close(fd);
     return WOODY_STATUS_OK;
 }
 
