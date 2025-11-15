@@ -59,6 +59,7 @@ static const char *errors[WOODY_MAX_ERRORS] = {
         } \
     } \
 }
+
 #define unlikely(x)     __builtin_expect(!!(x), 0)
 #define LOG_ERR(FMT,...) \
     fprintf(stderr, "ERR|%s:%d|%s|" FMT "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
@@ -169,8 +170,7 @@ static int initialize_context(woodyCtx *ctx, void *map, size_t size) {
     Elf64_Shdr *shdr = (Elf64_Shdr *)((char*)map + ctx->elf_hdr->e_shoff);
 
     if ((char*)shdr - (char*)map > size) {
-        fprintf(stderr, "Unable to retrieve .text section from program headers");
-        return 1;
+        return ERR_CORRUPTED_FILE;
     }
 
     Elf64_Shdr *shstrtab = &shdr[ctx->elf_hdr->e_shstrndx];
@@ -181,6 +181,10 @@ static int initialize_context(woodyCtx *ctx, void *map, size_t size) {
             ctx->text_shdr = _shdr;
             break;
         }
+    }
+
+    if (!ctx->text_shdr) {
+        return ERR_CORRUPTED_FILE;
     }
 
     ctx->phtab = map + ctx->elf_hdr->e_phoff;
@@ -198,12 +202,15 @@ static int initialize_context(woodyCtx *ctx, void *map, size_t size) {
         }
     }
 
-    ctx->new_phdr = calloc(1,sizeof(Elf64_Phdr));
+    if (!ctx->phdr || !ctx->text_phdr) {
+        return ERR_CORRUPTED_FILE;
+    }
+
     ctx->new_phdr->p_type = PT_LOAD;
     ctx->new_phdr->p_flags = (PF_R | PF_X);
     ctx->new_phdr->p_align = ctx->text_phdr->p_align;
 
-    return 0;
+    return WOODY_STATUS_OK;
 }
 
 
@@ -263,45 +270,101 @@ static void patch_phdr(woodyCtx *ctx) {
     ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
 }
 
-int get_random_key(char *key, size_t key_len) {
+static int get_random_key(char *key, size_t key_len) {
+
     int fd = open("/dev/urandom", O_RDONLY);
-    read(fd, key, key_len);
+    if (fd == -1) {
+        return ERR_EXTLIB_CALL;
+    }
+
+    /* Si no puedo leer 32 bytes de un fichero algo esta muy muy pocho */
+    if (read(fd, key, key_len) != key_len) {
+        return ERR_EXTLIB_CALL;
+    }
+
+    return WOODY_STATUS_OK;
 }
 
-void encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
+/* Nota: Cifrar otras secciones del PT_LOAD rompe la carga dinámica en la mayoría de los casos porque puede contener
+ * rutinas que se ejecutan antes de ceder el control a e_entry, que es donde nosotros desciframos el código a ejecutar.
+ */
+static int encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
 
-    /* Cifrar otras secciones del PT_LOAD rompe la carga dinámica en la mayoría de los casos.
-     */
+    TRY_RET(get_random_key(ctx->key, sizeof(ctx->key)));
 
-    /* Ciframos con un simple xor byte a byte */
-    get_random_key(ctx->key, sizeof(ctx->key));
     /* Initial offset of the .text section computed from the entry: */
-    printf("Antes de cifrar: p_offset=%lx, p_vaddr=%lx, p_entry=%lx\n", ctx->text_phdr->p_offset, ctx->text_phdr->p_vaddr, ctx->initial_entrypoint);
     char *mem = (char *)map + ctx->text_phdr->p_offset + ctx->initial_entrypoint - ctx->text_phdr->p_vaddr;
     /*           ------------------------------------   ---------------------------------------------------
      *           Inicio del PT_LOAD que contiene .text  Resta de vaddr para saber el offset REAL donde empieza
-     *                                                  el entry. vaddr es donde cargar, pero también son cantidades
-     *                                                  de memoria. Si 2 items pertenecen a un mismo PT_LOAD, los offsets entre
+     *                                                  el entry. Si 2 items pertenecen a un mismo PT_LOAD, los offsets entre
      *                                                  vaddr son los offsets dentro del fichero, pues el chunk entero se carga.
      */
     char *mem_end = (char *)map + ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size;
     ctx->text_len = mem_end - mem;
+
+    /* Ciframos con un simple xor byte a byte */
     for (int i=0; i < ctx->text_len; i++) {
         mem[i] ^= ctx->key[i&(0xff>>3)];
     }
 
     /* Cambiamos los permisos del PT_LOAD que contiene el .text para poder descrifrar en la carga */
     ctx->text_phdr->p_flags = (PF_R | PF_W | PF_X);
+
+    return WOODY_STATUS_OK;
 }
 
-static int print_mem(const char *mem, size_t size) {
+/* payload_size MUST NOT include the null terminator. */
+static void patch_payload(woodyCtx *ctx, char *payload, size_t payload_size) {
 
-    for (int i=0; i < size; i++) {
-        printf("%x", mem[i]);
+    typedef struct payloadPatchData {
+        Elf64_Addr ct_start;
+        Elf64_Xword ct_size;
+        Elf64_Addr shellcode_start;
+        uint8_t key[32];
+    } payloadPatchData;
+
+    /* Parcheamos el shellcode */
+    char *p = &payload[payload_size - sizeof(payloadPatchData)];
+
+    memcpy(p, &ctx->initial_entrypoint, sizeof(((payloadPatchData *)0)->ct_start));
+    p += sizeof(((payloadPatchData *)0)->ct_start);
+
+    memcpy(p, &ctx->text_len, sizeof(((payloadPatchData *)0)->ct_size));
+    p += sizeof(((payloadPatchData *)0)->ct_size);
+
+    /* La vaddr donde esté el shellcode es el p_vaddr + sizeof(todos los program headers) */
+    memcpy(p, &ctx->elf_hdr->e_entry, sizeof(((payloadPatchData *)0)->shellcode_start));
+    p += sizeof(((payloadPatchData *)0)->shellcode_start);
+
+    memcpy(p, ctx->key, sizeof(ctx->key));
+
+    char buf[100]={0}, *q=buf;
+    q += sprintf(q, "key=");
+    for (int i=0; i<sizeof(ctx->key); i++) {
+        q += sprintf(q, "%02x", ctx->key[i]);
     }
-    printf("\n");
+    sprintf(q, "\n");
+    printf(buf);
 }
 
+static int build_new_elf_file(int fd_new, woodyCtx *ctx, void *map, size_t size, const char *payload, size_t payload_sz) {
+
+    /* Escribimos el contenido inicial del fichero (adecuadamente modificado)*/
+    TRY_RET(_write(fd_new, map, size));
+
+    /* Rellenamos el espacio entre el final del fichero y nuestro inicio de seccion, que tiene
+     * que estar alineado porque es un PT_LOAD.*/
+    char buf[4096]={0};
+    TRY_RET(_write(fd_new, buf, ALIGN(size, ctx->new_phdr->p_align) - size));
+
+    TRY_RET(_write(fd_new, ctx->phtab, sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum-1)));
+
+    TRY_RET(_write(fd_new, ctx->new_phdr, sizeof(Elf64_Phdr)));
+
+    TRY_RET(_write(fd_new, payload, payload_sz));
+
+    return WOODY_STATUS_OK;
+}
 
 int do_woody(char* filename, int fd, void* map, size_t size) {
 
@@ -322,12 +385,13 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
         return ERR_CORRUPTED_FILE;
     }
 
-    initialize_context(ctx, map, size);
+    /* Inicializamos en stack el nuevo phdr porque este no va a apuntar a memoria reservada con mmap */
+    ctx->new_phdr = &(Elf64_Phdr){0};
+    TRY_RET(initialize_context(ctx, map, size));
 
     int fd_new = open("woody", O_CREAT | O_RDWR, 00744);
     if (fd_new == -1) {
-        printf("Cannot open file \n");
-        return 1;
+        return ERR_EXTLIB_CALL;
     }
 
     char payload[]=
@@ -345,59 +409,14 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44" // => key
     "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44";
 
-    /* helper struct para accesibilidad de datos en shellcode. */
-    typedef struct payloadPatchData {
-        uint64_t ct_start;
-        uint64_t ct_size;
-        uint64_t shellcode_start;
-        uint8_t key[32];
-    } payloadPatchData;
-
     // TODO hacer algo con estos magic numbers
-    set_new_program_header(ctx, size, sizeof(payload)-1+(8*3)+32);
+    set_new_program_header(ctx, size, sizeof(payload)-1);
     patch_phdr(ctx);
-    encrypt_text_section(ctx, map, size);
+    TRY_RET(encrypt_text_section(ctx, map, size));
+    patch_payload(ctx, payload, sizeof(payload)-1);
+    TRY_RET(build_new_elf_file(fd_new, ctx, map, size, payload, sizeof(payload)-1));
 
-    /* Parcheamos el shellcode */
-    char *p = &payload[sizeof(payload)-(8*3)-32-1];
-
-    memcpy(p, &ctx->initial_entrypoint, sizeof(Elf64_Addr));
-    p += sizeof(Elf64_Addr);
-
-    memcpy(p, &ctx->text_len, sizeof(Elf64_Xword));
-    p += sizeof(Elf64_Xword);
-
-    /* La vaddr donde esté el shellcode es el p_vaddr + sizeof(todos los program headers) */
-    memcpy(p, &ctx->elf_hdr->e_entry, sizeof(Elf64_Addr));
-    p += sizeof(Elf64_Addr);
-
-    memcpy(p, ctx->key, sizeof(ctx->key));
-
-    printf("sh_offset=%lx, sh_addr=%lx, sh_size=%lx\n", ctx->text_shdr->sh_offset, ctx->text_shdr->sh_addr, ctx->text_shdr->sh_size);
-    printf("key=");
-    for (int i=0; i<sizeof(ctx->key); i++) {
-        printf("%02x", ctx->key[i]);
-    }
-    printf("\n");
-
-    /* Escribimos el contenido del fichero*/
-    _write(fd_new, map, size);
-
-    /* Creamos espacio dentro del archivo para lo que vamos a escribir */
-    fallocate(fd_new, FALLOC_FL_ZERO_RANGE, size, ALIGNED_SIZE(ctx->new_phdr) - size);
-
-    /* Copiamos la phtable actual al final del fichero (-1 porque ya está sumado el nuevo PT_LOAD)*/
-    lseek(fd_new, ctx->phdr->p_offset, SEEK_SET);
-    _write(fd_new, ctx->phtab, sizeof(Elf64_Phdr)*(ctx->elf_hdr->e_phnum-1));
-
-    /* Añadimos nuestro phdr */
-    _write(fd_new, ctx->new_phdr, sizeof(Elf64_Phdr));
-
-    /* Escribimos el payload */
-    lseek(fd_new, ctx->new_phdr->p_offset + sizeof(Elf64_Phdr)*ctx->elf_hdr->e_phnum, SEEK_SET);
-    _write(fd_new, payload, sizeof(payload));
-
-    exit(0);
+    return WOODY_STATUS_OK;
 }
 
 void woody_main(char* filename) {
