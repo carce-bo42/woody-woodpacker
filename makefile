@@ -1,7 +1,7 @@
 NAME := woody_woodpacker
 
-CFLAGS = #-Wall -Wextra -Werror
-CFLAGS += -Wno-comment -Wno-unused-variable -Wno-unused-parameter
+CFLAGS = -Wall -Wextra -Werror
+#CFLAGS += -Wno-comment -Wno-unused-variable -Wno-unused-parameter
 ###CFLAGS += -fsanitize=address
 
 CC := gcc
@@ -24,7 +24,7 @@ all: $(OBJ_DIR) $(NAME)
 $(OBJ_DIR):
 	@[ ! -d $@ ] && mkdir -p $@
 
-debug: CFLAGS += -D_woodydebug -g3
+debug: CFLAGS += -g3
 debug: all 
 
 $(NAME): $(OBJ)

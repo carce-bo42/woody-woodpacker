@@ -19,10 +19,6 @@
 #include <stddef.h>
 #include <assert.h>
 
-#ifdef __woodydebug
-void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr);
-#endif
-
 #define IS_NOT_ELF(ehdr) (                           \
     ((ehdr)->e_ident[EI_DATA] != ELFDATA2LSB         \
       && (ehdr)->e_ident[EI_DATA] != ELFDATA2MSB)    \
@@ -169,7 +165,7 @@ static int initialize_context(woodyCtx *ctx, void *map, size_t size) {
     ctx->elf_hdr = map;
     Elf64_Shdr *shdr = (Elf64_Shdr *)((char*)map + ctx->elf_hdr->e_shoff);
 
-    if ((char*)shdr - (char*)map > size) {
+    if ((size_t)((char*)shdr - (char*)map) > size) {
         return ERR_CORRUPTED_FILE;
     }
 
@@ -270,7 +266,7 @@ static void patch_phdr(woodyCtx *ctx) {
     ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
 }
 
-static int get_random_key(char *key, size_t key_len) {
+static int get_random_key(uint8_t *key, size_t key_len) {
 
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd == -1) {
@@ -278,7 +274,7 @@ static int get_random_key(char *key, size_t key_len) {
     }
 
     /* Si no puedo leer 32 bytes de un fichero algo esta muy muy pocho */
-    if (read(fd, key, key_len) != key_len) {
+    if (read(fd, key, key_len) != (ssize_t)key_len) {
         return ERR_EXTLIB_CALL;
     }
 
@@ -288,7 +284,7 @@ static int get_random_key(char *key, size_t key_len) {
 /* Nota: Cifrar otras secciones del PT_LOAD rompe la carga dinámica en la mayoría de los casos porque puede contener
  * rutinas que se ejecutan antes de ceder el control a e_entry, que es donde nosotros desciframos el código a ejecutar.
  */
-static int encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
+static int encrypt_text_section(woodyCtx *ctx, void *map) {
 
     TRY_RET(get_random_key(ctx->key, sizeof(ctx->key)));
 
@@ -303,7 +299,7 @@ static int encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
     ctx->text_len = mem_end - mem;
 
     /* Ciframos con un simple xor byte a byte */
-    for (int i=0; i < ctx->text_len; i++) {
+    for (Elf64_Xword i=0; i < ctx->text_len; i++) {
         mem[i] ^= ctx->key[i&(0xff>>3)];
     }
 
@@ -340,7 +336,7 @@ static void patch_payload(woodyCtx *ctx, char *payload, size_t payload_size) {
 
     char buf[100]={0}, *q=buf;
     q += sprintf(q, "key=");
-    for (int i=0; i<sizeof(ctx->key); i++) {
+    for (unsigned long int i=0; i<sizeof(ctx->key); i++) {
         q += sprintf(q, "%02x", ctx->key[i]);
     }
     sprintf(q, "\n");
@@ -366,7 +362,7 @@ static int build_new_elf_file(int fd_new, woodyCtx *ctx, void *map, size_t size,
     return WOODY_STATUS_OK;
 }
 
-int do_woody(char* filename, int fd, void* map, size_t size) {
+static int do_woody(void* map, size_t size) {
 
     Elf64_Ehdr *ehdr = map;          /* Elf Header */
     woodyCtx *ctx = &(woodyCtx){0};
@@ -412,7 +408,7 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     // TODO hacer algo con estos magic numbers
     set_new_program_header(ctx, size, sizeof(payload)-1);
     patch_phdr(ctx);
-    TRY_RET(encrypt_text_section(ctx, map, size));
+    TRY_RET(encrypt_text_section(ctx, map));
     patch_payload(ctx, payload, sizeof(payload)-1);
     TRY_RET(build_new_elf_file(fd_new, ctx, map, size, payload, sizeof(payload)-1));
 
@@ -443,7 +439,7 @@ void woody_main(char* filename) {
     }
     switch ((int)((unsigned char *)map)[EI_CLASS]) {
         case ELFCLASS64:
-            int ret = do_woody(filename, fd, map, st.st_size);
+            int ret = do_woody(map, st.st_size);
             if (ret != WOODY_STATUS_OK) {
                 LOG_ERR("%s", errors[ret]);
             }
@@ -475,52 +471,3 @@ int main(int argc,char** argv) {
     }
     return 0;
 }
-
-
-#ifdef __woodydebug
-void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr) {
-
-    (void*)map;
-    (void)size;
-    printf("===> Program Header <=====");
-    printf("TYPE=");
-    switch(phdr->p_type) {
-        case PT_NULL: printf("PT_NULL"); break;
-        case PT_LOAD: printf("PT_LOAD"); break;
-        case PT_DYNAMIC: printf("PT_DYNAMIC"); break;
-        case PT_INTERP: printf("PT_INTERP"); break;
-        case PT_NOTE: printf("PT_NOTE"); break;
-        case PT_SHLIB: printf("PT_SHLIB"); break;
-        case PT_PHDR: printf("PT_PHDR"); break;
-        case PT_TLS: printf("PT_TLS"); break;
-        case PT_NUM: printf("PT_NUM"); break;
-        case PT_LOOS: printf("PT_LOOS"); break;
-        case PT_GNU_EH_FRAME: printf("PT_GNU_EH_FRAME"); break;
-        case PT_GNU_STACK: printf("PT_GNU_STACK"); break;
-        case PT_GNU_RELRO: printf("PT_GNU_RELRO"); break;
-        case PT_GNU_PROPERTY: printf("PT_GNU_PROPERTY"); break;
-        case PT_GNU_SFRAME: printf("PT_GNU_SFRAME"); break;
-        case PT_LOSUNW: printf("PT_LOSUNW|PT_SUNWBSS"); break;
-        case PT_SUNWSTACK: printf("PT_SUNWSTACK"); break;
-        case PT_HISUNW: printf("PT_HISUNW|PT_HIOS"); break;
-        case PT_LOPROC: printf("PT_LOPROC"); break;
-        case PT_HIPROC: printf("PT_HIPROC"); break;
-        default: printf("????: %x", phdr->p_type);
-    }
-    printf("\n");
-    printf("FLAGS={");
-    if (phdr->p_flags & PF_X) printf(" PF_X");
-    if (phdr->p_flags & PF_W) printf(" PF_W");
-    if (phdr->p_flags & PF_R) printf(" PF_R");
-    if (phdr->p_flags & PF_MASKPROC) printf(" PF_MASKPROC");
-    if (phdr->p_flags & PF_MASKOS) printf(" PF_MASKOS");
-    printf(" }\n");
-    printf("phdr->p_align=%016lx\n", phdr->p_align);
-    printf("phdr->p_filesz=%016lx\n", phdr->p_filesz);
-    printf("phdr->p_memsz=%016lx\n", phdr->p_memsz);
-    printf("phdr->p_offset=%016lx\n", phdr->p_offset);
-    printf("phdr->p_paddr=%016lx\n", phdr->p_paddr);
-    printf("phdr->p_vaddr=%016lx\n", phdr->p_vaddr);
-    printf("------------------------------------------------------------\n");
-}
-#endif
