@@ -9,10 +9,10 @@
 #  error "Need ELF header."
 #endif
 
-#include "libft/libft.h"
 #include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <string.h>
@@ -23,21 +23,45 @@
 void debug_program_header(void* map, Elf64_Half size, Elf64_Phdr* phdr);
 #endif
 
-/* Endianness of the binary */
-static int end = 0;
-
-#define swap(p) (end == ELFDATA2LSB ? p : \
-                    sizeof(p) == 8 ? __builtin_bswap64(p) : \
-                    sizeof(p) == 4 ? __builtin_bswap32(p) : \
-                                     __builtin_bswap16(p))
-
 #define IS_NOT_ELF(ehdr) (                           \
     ((ehdr)->e_ident[EI_DATA] != ELFDATA2LSB         \
       && (ehdr)->e_ident[EI_DATA] != ELFDATA2MSB)    \
     || ehdr->e_ident[EI_VERSION] != EV_CURRENT       \
-    || swap(ehdr->e_ehsize) != sizeof(Elf64_Ehdr)    \
-    || swap(ehdr->e_shentsize) != sizeof(Elf64_Shdr) \
+    || ehdr->e_ehsize != sizeof(Elf64_Ehdr)    \
+    || ehdr->e_shentsize != sizeof(Elf64_Shdr) \
 )
+
+enum woodyStatus {
+    WOODY_STATUS_OK = 0,
+    ERR_CORRUPTED_FILE,
+    ERR_EXTLIB_CALL,
+    WOODY_MAX_ERRORS
+};
+
+static const char *errors[WOODY_MAX_ERRORS] = {
+    [WOODY_STATUS_OK]    = "",
+    [ERR_CORRUPTED_FILE] = "Input file format is either not ELF or corrupted",
+    [ERR_EXTLIB_CALL] = "An external library call failed during execution"
+};
+
+#define LOG_ERRNO() \
+    if (errno!=0) { \
+        LOG_ERR("%s: %s", errors[ERR_EXTLIB_CALL], strerror(errno)); \
+    }
+
+#define TRY_RET(COMMAND) { \
+    int __ret=(COMMAND); \
+    if (unlikely(__ret!=WOODY_STATUS_OK)) { \
+        if (__ret==ERR_EXTLIB_CALL) { \
+            LOG_ERRNO(); \
+        } else { \
+            LOG_ERR("%s", errors[__ret]); \
+        } \
+    } \
+}
+#define unlikely(x)     __builtin_expect(!!(x), 0)
+#define LOG_ERR(FMT,...) \
+    fprintf(stderr, "ERR|%s:%d|%s|" FMT "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 
 /* alignment MUST be a power of 2 */
 #define ALIGNED_SIZE(phdr) ALIGN((phdr)->p_filesz, (phdr)->p_align)
@@ -67,7 +91,7 @@ static int _write(int fd, const void *buf, size_t len) {
             if (errno == EINTR) {
                 continue;
             }
-            return -1;
+            return ERR_EXTLIB_CALL;
         }
         if (bytes_written == 0) {
             break;
@@ -75,7 +99,67 @@ static int _write(int fd, const void *buf, size_t len) {
         total_written += bytes_written;
     }
 
-    return 0;
+    return WOODY_STATUS_OK;
+}
+
+/* See https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.eheader.html#elfid */
+static size_t get_ehdr_e_shnum(void* map, Elf64_Ehdr* ehdr) {
+    if (ehdr->e_shnum >= SHN_LORESERVE) {
+        return ((Elf64_Shdr *)(map + ehdr->e_shoff))->sh_size;
+    }
+    return ehdr->e_shnum;
+}
+
+/*
+ * Calcula cuanto mide el fichero elf buscando cual es el offset + tamaño
+ * más grande que hay. De esta forma el orden dentro del fichero nos da igual.
+ * See https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.intro.html
+ */
+static int get_elf_size(void *map, Elf64_Ehdr *ehdr, size_t actual_size, size_t *computed_size) {
+
+    size_t total = 0;
+    Elf64_Off phoff = ehdr->e_phoff;
+    Elf64_Off shoff = ehdr->e_shoff;
+    Elf64_Half shentsize = ehdr->e_shentsize;
+    Elf64_Half phentsize = ehdr->e_phentsize;
+    size_t shnum = get_ehdr_e_shnum(map, ehdr);
+    Elf64_Half phnum = ehdr->e_phnum;
+
+    /* Most programs should be ok with this block */
+    if (phoff < shoff) {
+        total = shoff + shnum * shentsize;
+    } else {
+        total =  phoff + phnum * phentsize;
+    }
+    /* BUT this is not forbidden in the standard */
+    for (size_t i = 0; i < phnum; i++) {
+        if (phoff + i * phentsize > actual_size) {
+            return ERR_CORRUPTED_FILE;
+        }
+        Elf64_Phdr *phent = map + phoff + i * phentsize;
+        Elf64_Off p_offset = phent->p_offset;
+        Elf64_Xword p_filesz = phent->p_filesz;
+        if (p_offset + p_filesz > total) {
+            total = p_offset + p_filesz;
+        }
+    }
+    for (size_t i = 0; i < shnum; i++) {
+        if (shoff + i * shentsize > actual_size) {
+            return ERR_CORRUPTED_FILE;
+        }
+        Elf64_Shdr *shent = map + shoff + i * shentsize;
+        Elf64_Off sh_offset = shent->sh_offset;
+        Elf64_Xword sh_size = shent->sh_size;
+        if (sh_offset + sh_size > total) {
+            /* "A section of type SHT_NOBITS may have a non-zero size,
+             * but it occupies no space in the file." */
+            if (shent->sh_type != SHT_NOBITS ) {
+                total = sh_offset + sh_size;
+            }
+        }
+    }
+    *computed_size = total;
+    return WOODY_STATUS_OK;
 }
 
 
@@ -83,10 +167,12 @@ static int initialize_context(woodyCtx *ctx, void *map, size_t size) {
 
     ctx->elf_hdr = map;
     Elf64_Shdr *shdr = (Elf64_Shdr *)((char*)map + ctx->elf_hdr->e_shoff);
+
     if ((char*)shdr - (char*)map > size) {
         fprintf(stderr, "Unable to retrieve .text section from program headers");
         return 1;
     }
+
     Elf64_Shdr *shstrtab = &shdr[ctx->elf_hdr->e_shstrndx];
     for (int i=0; i < ctx->elf_hdr->e_shnum; i++) {
         Elf64_Shdr *_shdr = &shdr[i];
@@ -173,7 +259,6 @@ static void patch_phdr(woodyCtx *ctx) {
     /* Modificamos el Elf header */
     ctx->elf_hdr->e_phnum += 1;
     ctx->elf_hdr->e_phoff = ctx->phdr->p_offset;
-    //printf("initial entrypoint: %lx\n", ctx->elf_hdr->e_entry);
     ctx->initial_entrypoint = ctx->elf_hdr->e_entry;
     ctx->elf_hdr->e_entry = ctx->new_phdr->p_vaddr + original_phtab_size + sizeof(Elf64_Phdr);
 }
@@ -194,13 +279,13 @@ void encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
     printf("Antes de cifrar: p_offset=%lx, p_vaddr=%lx, p_entry=%lx\n", ctx->text_phdr->p_offset, ctx->text_phdr->p_vaddr, ctx->initial_entrypoint);
     char *mem = (char *)map + ctx->text_phdr->p_offset + ctx->initial_entrypoint - ctx->text_phdr->p_vaddr;
     /*           ------------------------------------   ---------------------------------------------------
-     *           Inicio del PT_LOAd que contiene .text  Resta de vaddr para saber el offset REAL donde empieza
+     *           Inicio del PT_LOAD que contiene .text  Resta de vaddr para saber el offset REAL donde empieza
      *                                                  el entry. vaddr es donde cargar, pero también son cantidades
      *                                                  de memoria. Si 2 items pertenecen a un mismo PT_LOAD, los offsets entre
      *                                                  vaddr son los offsets dentro del fichero, pues el chunk entero se carga.
      */
-    char *end = (char *)map + ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size;
-    ctx->text_len = end - mem;
+    char *mem_end = (char *)map + ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size;
+    ctx->text_len = mem_end - mem;
     for (int i=0; i < ctx->text_len; i++) {
         mem[i] ^= ctx->key[i&(0xff>>3)];
     }
@@ -223,36 +308,50 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     Elf64_Ehdr *ehdr = map;          /* Elf Header */
     woodyCtx *ctx = &(woodyCtx){0};
 
-    /* static global, used in every swap */
-    end = ehdr->e_ident[EI_DATA];
+    if (size < sizeof(Elf64_Ehdr)) {
+        return ERR_CORRUPTED_FILE;
+    }
+
     if (IS_NOT_ELF(ehdr)) {
-        return 1;
+        return ERR_CORRUPTED_FILE;
+    }
+
+    size_t computed_size = 0;
+    TRY_RET(get_elf_size(map, ehdr, size, &computed_size));
+    if (size != computed_size) {
+        return ERR_CORRUPTED_FILE;
     }
 
     initialize_context(ctx, map, size);
 
-    char new_filename[100]={0};
-    sprintf(new_filename, "%s_out", filename);
-    int fd_new = open("woody_out", O_CREAT | O_RDWR, 00744);
+    int fd_new = open("woody", O_CREAT | O_RDWR, 00744);
     if (fd_new == -1) {
         printf("Cannot open file \n");
         return 1;
     }
 
     char payload[]=
-"\x57\x56\x52\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35"
-"\x5a\x00\x00\x00\xba\x0e\x00\x00\x00\x0f\x05\x48\x8d\x0d\xde\xff"
-"\xff\xff\x4c\x8b\x05\x63\x00\x00\x00\x4c\x29\xc1\x4c\x8b\x05\x49"
-"\x00\x00\x00\x49\x01\xc8\x4c\x89\xc6\x48\x89\xf2\x48\x03\x15\x41"
-"\x00\x00\x00\x48\x8d\x0d\x4a\x00\x00\x00\x48\x31\xc0\x48\x39\xd6"
-"\x74\x16\x48\x83\xe0\x1f\x48\x8d\x3c\x01\x44\x8a\x0f\x44\x30\x0e"
-"\x48\xff\xc0\x48\xff\xc6\xeb\xe5\x5a\x5e\x5f\x41\xff\xe0\x2e\x2e"
-"\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x2e\x2e\x0a"
-"\x11\x11\x11\x11\x11\x11\x11\x11" // => ciphertext start vaddr
-"\x22\x22\x22\x22\x22\x22\x22\x22" //=> ciphertext size
-"\x33\x33\x33\x33\x33\x33\x33\x33" // => vaddr of the shellcode
-"\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44" // => key
-"\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44";
+    "\x57\x56\x52\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35"
+    "\x5a\x00\x00\x00\xba\x0e\x00\x00\x00\x0f\x05\x48\x8d\x0d\xde\xff"
+    "\xff\xff\x4c\x8b\x05\x63\x00\x00\x00\x4c\x29\xc1\x4c\x8b\x05\x49"
+    "\x00\x00\x00\x49\x01\xc8\x4c\x89\xc6\x48\x89\xf2\x48\x03\x15\x41"
+    "\x00\x00\x00\x48\x8d\x0d\x4a\x00\x00\x00\x48\x31\xc0\x48\x39\xd6"
+    "\x74\x16\x48\x83\xe0\x1f\x48\x8d\x3c\x01\x44\x8a\x0f\x44\x30\x0e"
+    "\x48\xff\xc0\x48\xff\xc6\xeb\xe5\x5a\x5e\x5f\x41\xff\xe0\x2e\x2e"
+    "\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x2e\x2e\x0a"
+    "\x11\x11\x11\x11\x11\x11\x11\x11" // => ciphertext start vaddr
+    "\x22\x22\x22\x22\x22\x22\x22\x22" //=> ciphertext size
+    "\x33\x33\x33\x33\x33\x33\x33\x33" // => vaddr of the shellcode
+    "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44" // => key
+    "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44";
+
+    /* helper struct para accesibilidad de datos en shellcode. */
+    typedef struct payloadPatchData {
+        uint64_t ct_start;
+        uint64_t ct_size;
+        uint64_t shellcode_start;
+        uint8_t key[32];
+    } payloadPatchData;
 
     // TODO hacer algo con estos magic numbers
     set_new_program_header(ctx, size, sizeof(payload)-1+(8*3)+32);
@@ -301,67 +400,57 @@ int do_woody(char* filename, int fd, void* map, size_t size) {
     exit(0);
 }
 
-int woody_main(char* filename) {
+void woody_main(char* filename) {
 
     int fd = -1;
     struct stat st;
-    int ret = 0;
     void* map = MAP_FAILED;
 
-
-
     if ((fd = open(filename, O_RDONLY | O_NONBLOCK)) == -1) {
-        goto print_errno;
+        LOG_ERRNO();
+        goto cleanup;
     }
     if (fstat(fd, &st) == -1) {
-        goto print_errno;
+        LOG_ERRNO();
+        goto cleanup;
     }
     if ((map = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0)) == MAP_FAILED) {
-        goto print_errno;
+        LOG_ERRNO();
+        goto cleanup;
     }
-    if (ft_strncmp((const char *)map, ELFMAG, SELFMAG)) {
-        goto print_file_format_not_recognized;
+    if (strncmp((const char *)map, ELFMAG, SELFMAG)) {
+        LOG_ERR("%s", errors[ERR_CORRUPTED_FILE]);
+        goto cleanup;
     }
     switch ((int)((unsigned char *)map)[EI_CLASS]) {
         case ELFCLASS64:
-            if ((unsigned long)st.st_size < sizeof(Elf64_Ehdr)
-                || do_woody(filename, fd, map, st.st_size) == -1)
-                goto print_file_format_not_recognized;
+            int ret = do_woody(filename, fd, map, st.st_size);
+            if (ret != WOODY_STATUS_OK) {
+                LOG_ERR("%s", errors[ret]);
+            }
             break;
         default:
-            goto print_file_format_not_recognized;
+            ;
     }
-    goto cleanup;
 
-print_file_format_not_recognized:
-    fprintf(stderr, "ft_nm: %s: file format not recognized\n", filename);
-    ret = 1;
-print_errno:
-    if (errno != 0) {
-        ret = errno;
-        fprintf(stderr, "%s: %s\n", "ft_nm: ", strerror(errno));
-    }
 cleanup:
+
     if (map != MAP_FAILED && munmap(map, st.st_size) == -1) {
-        ret = errno;
-        fprintf(stderr, "%s: %s\n", "ft_nm: ", strerror(errno));
+        LOG_ERRNO();
     }
+
     if (fd != -1 && close(fd) == -1) {
-        ret = errno;
-        fprintf(stderr, "%s: %s\n", "ft_nm: ", strerror(errno));
+        LOG_ERRNO();
     }
-    return ret;
 }
 
 int main(int argc,char** argv) {
-
-    //sleep(10000);
 
     char filename[4096] = {0};
 
     for (int i=1; i<argc; i++) {
         if (argv[i]) {
-            memcpy(filename, argv[i], ft_strlen(argv[i]));
+            memcpy(filename, argv[i], strlen(argv[i]));
         }
         woody_main(filename);
     }

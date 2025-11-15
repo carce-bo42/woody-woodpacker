@@ -1,4 +1,4 @@
-NAME := woody
+NAME := woody_woodpacker
 
 CFLAGS = #-Wall -Wextra -Werror
 CFLAGS += -Wno-comment -Wno-unused-variable -Wno-unused-parameter
@@ -8,8 +8,6 @@ CC := gcc
 
 SRC_FILES := woody.c
 
-LIBFT_DIR := libft/
-
 SRC_DIR := src
 SRC := $(addprefix $(SRC_DIR)/, $(SRC_FILES))
 
@@ -17,7 +15,7 @@ OBJ_DIR := obj
 OBJ := $(addprefix $(OBJ_DIR)/, $(SRC_FILES:.c=.o))
 
 INC_DIR := include
-INC_FLAGS = -I $(INC_DIR) -I $(LIBFT_DIR) -I.
+INC_FLAGS = -I $(INC_DIR) -I.
 
 .PHONY: all
 
@@ -29,25 +27,18 @@ $(OBJ_DIR):
 debug: CFLAGS += -D_woodydebug -g3
 debug: all 
 
-$(NAME): $(LIBFT_DIR)/libft.a
 $(NAME): $(OBJ)
 	$(CC) $(CFLAGS) $(INC_FLAGS) $^ -o $@
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) $(INC_FLAGS) -c $? -o $@
 
-$(LIBFT_DIR)/libft.a:
-	make -C $(LIBFT_DIR)
-
 .PHONY: clean fclean re
 
-
 clena clnea claen clean:
-	make clean -C $(LIBFT_DIR)
 	rm -rf $(OBJ_DIR)/*.o
 
 fclena fclnea fclaen fclean: clean
-	make fclean -C $(LIBFT_DIR)
 	rm -f $(NAME)
 	rm -rf $(OBJ_DIR)
 
