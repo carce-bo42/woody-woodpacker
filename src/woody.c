@@ -405,11 +405,14 @@ static int do_woody(void* map, size_t size) {
     "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44" // => key
     "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44";
 
-    // TODO hacer algo con estos magic numbers
     set_new_program_header(ctx, size, sizeof(payload)-1);
+
     patch_phdr(ctx);
+
     TRY_RET(encrypt_text_section(ctx, map));
+
     patch_payload(ctx, payload, sizeof(payload)-1);
+
     TRY_RET(build_new_elf_file(fd_new, ctx, map, size, payload, sizeof(payload)-1));
 
     return WOODY_STATUS_OK;
