@@ -61,7 +61,6 @@ static const char *errors[WOODY_MAX_ERRORS] = {
     fprintf(stderr, "ERR|%s:%d|%s|" FMT "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__);
 
 /* alignment MUST be a power of 2 */
-#define ALIGNED_SIZE(phdr) ALIGN((phdr)->p_filesz, (phdr)->p_align)
 #define ALIGN(addr, alignment) (((addr)+(alignment)-1)&~((alignment)-1))
 
 typedef struct woodyCtx {
