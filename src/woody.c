@@ -425,6 +425,7 @@ void woody_main(char* filename) {
     int fd = -1;
     struct stat st;
     void* map = MAP_FAILED;
+    int ret;
 
     if ((fd = open(filename, O_RDONLY | O_NONBLOCK)) == -1) {
         LOG_ERRNO();
@@ -444,8 +445,7 @@ void woody_main(char* filename) {
     }
     switch ((int)((unsigned char *)map)[EI_CLASS]) {
         case ELFCLASS64:
-            int ret = do_woody(map, st.st_size);
-            if (ret != WOODY_STATUS_OK) {
+            if ((ret = do_woody(map, st.st_size))!= WOODY_STATUS_OK) {
                 LOG_ERR("%s", errors[ret]);
             }
             break;
