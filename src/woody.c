@@ -310,8 +310,7 @@ static int encrypt_text_section(woodyCtx *ctx, void *map) {
     return WOODY_STATUS_OK;
 }
 
-/* payload_size MUST NOT include the null terminator. */
-static void patch_payload(woodyCtx *ctx, char *payload, size_t payload_size) {
+static void patch_payload(woodyCtx *ctx, uint8_t *payload, size_t payload_size) {
 
     typedef struct payloadPatchData {
         Elf64_Addr ct_start;
@@ -321,7 +320,7 @@ static void patch_payload(woodyCtx *ctx, char *payload, size_t payload_size) {
     } payloadPatchData;
 
     /* Parcheamos el shellcode */
-    char *p = &payload[payload_size - sizeof(payloadPatchData)];
+    char *p = (char*)&payload[payload_size - sizeof(payloadPatchData)];
 
     memcpy(p, &ctx->initial_entrypoint, sizeof(((payloadPatchData *)0)->ct_start));
     p += sizeof(((payloadPatchData *)0)->ct_start);
@@ -341,10 +340,10 @@ static void patch_payload(woodyCtx *ctx, char *payload, size_t payload_size) {
         q += sprintf(q, "%02x", ctx->key[i]);
     }
     sprintf(q, "\n");
-    printf(buf);
+    printf("%s", buf);
 }
 
-static int build_new_elf_file(int fd_new, woodyCtx *ctx, void *map, size_t size, const char *payload, size_t payload_sz) {
+static int build_new_elf_file(int fd_new, woodyCtx *ctx, void *map, size_t size, const uint8_t *payload, size_t payload_sz) {
 
     /* Escribimos el contenido inicial del fichero (adecuadamente modificado)*/
     TRY_RET(_write(fd_new, map, size));
@@ -391,30 +390,32 @@ static int do_woody(void* map, size_t size) {
         return ERR_EXTLIB_CALL;
     }
 
-    char payload[]=
-    "\x57\x56\x52\xb8\x01\x00\x00\x00\xbf\x01\x00\x00\x00\x48\x8d\x35"
-    "\x5a\x00\x00\x00\xba\x0e\x00\x00\x00\x0f\x05\x48\x8d\x0d\xde\xff"
-    "\xff\xff\x4c\x8b\x05\x63\x00\x00\x00\x4c\x29\xc1\x4c\x8b\x05\x49"
-    "\x00\x00\x00\x49\x01\xc8\x4c\x89\xc6\x48\x89\xf2\x48\x03\x15\x41"
-    "\x00\x00\x00\x48\x8d\x0d\x4a\x00\x00\x00\x48\x31\xc0\x48\x39\xd6"
-    "\x74\x16\x48\x83\xe0\x1f\x48\x8d\x3c\x01\x44\x8a\x0f\x44\x30\x0e"
-    "\x48\xff\xc0\x48\xff\xc6\xeb\xe5\x5a\x5e\x5f\x41\xff\xe0\x2e\x2e"
-    "\x2e\x2e\x57\x4f\x4f\x44\x59\x2e\x2e\x2e\x2e\x0a"
-    "\x11\x11\x11\x11\x11\x11\x11\x11" // => ciphertext start vaddr
-    "\x22\x22\x22\x22\x22\x22\x22\x22" //=> ciphertext size
-    "\x33\x33\x33\x33\x33\x33\x33\x33" // => vaddr of the shellcode
-    "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44" // => key
-    "\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44\x44";
+    uint8_t payload[]= {
+        0x57, 0x56, 0x52, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xbf, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x35,
+        0x5a, 0x00, 0x00, 0x00, 0xba, 0x0e, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x8d, 0x0d, 0xde, 0xff,
+        0xff, 0xff, 0x4c, 0x8b, 0x05, 0x63, 0x00, 0x00, 0x00, 0x4c, 0x29, 0xc1, 0x4c, 0x8b, 0x05, 0x49,
+        0x00, 0x00, 0x00, 0x49, 0x01, 0xc8, 0x4c, 0x89, 0xc6, 0x48, 0x89, 0xf2, 0x48, 0x03, 0x15, 0x41,
+        0x00, 0x00, 0x00, 0x48, 0x8d, 0x0d, 0x4a, 0x00, 0x00, 0x00, 0x48, 0x31, 0xc0, 0x48, 0x39, 0xd6,
+        0x74, 0x16, 0x48, 0x83, 0xe0, 0x1f, 0x48, 0x8d, 0x3c, 0x01, 0x44, 0x8a, 0x0f, 0x44, 0x30, 0x0e,
+        0x48, 0xff, 0xc0, 0x48, 0xff, 0xc6, 0xeb, 0xe5, 0x5a, 0x5e, 0x5f, 0x41, 0xff, 0xe0, 0x2e, 0x2e,
+        0x2e, 0x2e, 0x57, 0x4f, 0x4f, 0x44, 0x59, 0x2e, 0x2e, 0x2e, 0x2e, 0x0a,
+        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, // => ciphertext start vaddr
+        0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, //=> ciphertext size
+        0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, // => vaddr of the shellcode
+        0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, // => key
+        0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44
+	};
 
-    set_new_program_header(ctx, size, sizeof(payload)-1);
+
+    set_new_program_header(ctx, size, sizeof(payload));
 
     patch_phdr(ctx);
 
     TRY_RET(encrypt_text_section(ctx, map));
 
-    patch_payload(ctx, payload, sizeof(payload)-1);
+    patch_payload(ctx, payload, sizeof(payload));
 
-    TRY_RET(build_new_elf_file(fd_new, ctx, map, size, payload, sizeof(payload)-1));
+    TRY_RET(build_new_elf_file(fd_new, ctx, map, size, payload, sizeof(payload)));
 
     return WOODY_STATUS_OK;
 }
