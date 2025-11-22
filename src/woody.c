@@ -285,9 +285,13 @@ static int get_random_key(uint8_t *key, size_t key_len) {
 /* Nota: Cifrar otras secciones del PT_LOAD rompe la carga dinámica en la mayoría de los casos porque puede contener
  * rutinas que se ejecutan antes de ceder el control a e_entry, que es donde nosotros desciframos el código a ejecutar.
  */
-static int encrypt_text_section(woodyCtx *ctx, void *map) {
+static int encrypt_text_section(woodyCtx *ctx, void *map, size_t size) {
 
     TRY_RET(get_random_key(ctx->key, sizeof(ctx->key)));
+
+    if (ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size > size) {
+        return ERR_CORRUPTED_FILE;
+    }
 
     /* Initial offset of the .text section computed from the entry: */
     char *mem = (char *)map + ctx->text_phdr->p_offset + ctx->initial_entrypoint - ctx->text_phdr->p_vaddr;
@@ -297,6 +301,10 @@ static int encrypt_text_section(woodyCtx *ctx, void *map) {
      *                                                  vaddr son los offsets dentro del fichero, pues el chunk entero se carga.
      */
     char *mem_end = (char *)map + ctx->text_shdr->sh_offset + ctx->text_shdr->sh_size;
+
+	if (mem_end <= mem) {
+		return ERR_CORRUPTED_FILE;
+    }
     ctx->text_len = mem_end - mem;
 
     /* Ciframos con un simple xor byte a byte */
@@ -411,7 +419,7 @@ static int do_woody(void* map, size_t size) {
 
     patch_phdr(ctx);
 
-    TRY_RET(encrypt_text_section(ctx, map));
+    TRY_RET(encrypt_text_section(ctx, map, size));
 
     patch_payload(ctx, payload, sizeof(payload));
 
