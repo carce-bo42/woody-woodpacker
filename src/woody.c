@@ -53,6 +53,7 @@ static const char *errors[WOODY_MAX_ERRORS] = {
         } else { \
             LOG_ERR("%s", errors[__ret]); \
         } \
+        return __ret; \
     } \
 }
 
